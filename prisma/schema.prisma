@@ -1,0 +1,216 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  ADMIN
+  AGENT
+  CUSTOMER
+}
+
+enum TicketStatus {
+  NEW
+  OPEN
+  PENDING
+  RESOLVED
+  CLOSED
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum Sentiment {
+  POSITIVE
+  NEUTRAL
+  FRUSTRATED
+  URGENT
+}
+
+enum MessageType {
+  PUBLIC_REPLY
+  INTERNAL_NOTE
+  SYSTEM_EVENT
+}
+
+model Organization {
+  id                        String      @id @default(uuid())
+  name                      String
+  industry                  String      @default("OTHER")
+  customIndustryDescription String?
+  planTier                  String      @default("MULTI_POD_ENTERPRISE")
+  totalSeats                Int         @default(8)
+  leadershipMode            String      @default("UNIFIED") // "UNIFIED" | "DEDICATED"
+  createdAt                 DateTime    @default(now())
+  updatedAt                 DateTime    @updatedAt
+
+  workspaces                Workspace[]
+  users                     User[]
+
+  @@map("organizations")
+}
+
+model User {
+  id                  String            @id @default(uuid())
+  username            String?           @unique
+  email               String            @unique
+  phone               String?
+  passwordHash        String
+  fullName            String
+  role                Role              @default(CUSTOMER)
+  avatarUrl           String?
+  verificationMethod  String?           @default("EMAIL")
+  onboardingCompleted Boolean           @default(false)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  organizationId      String?
+  organization        Organization?     @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+
+  createdTickets      Ticket[]          @relation("CustomerTickets")
+  assignedTickets     Ticket[]          @relation("AgentTickets")
+  messages            Message[]
+  auditLogs           AuditLog[]
+  ownedWorkspaces     Workspace[]       @relation("WorkspaceOwner")
+  workspaceMembership WorkspaceMember?  @relation("WorkspaceMembership")
+
+  @@index([organizationId])
+  @@map("users")
+}
+
+model Workspace {
+  id             String                 @id @default(uuid())
+  name           String
+  podCategory    String                 @default("GENERAL") // "TRACKING", "BILLING", "CLAIMS", "TECHNICAL", "CUSTOM", etc.
+  description    String?                // Semantic keywords for AI Triage
+  isCatchAll     Boolean                @default(false)
+  inviteToken    String                 @default(uuid())
+  maxMembers     Int                    @default(8)
+
+  ownerId        String
+  owner          User                   @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  organizationId String?
+  organization   Organization?          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  members        WorkspaceMember[]
+  inviteTokens   WorkspaceInviteToken[]
+  tickets        Ticket[]               @relation("WorkspaceTickets")
+
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+
+  @@index([organizationId])
+  @@index([ownerId])
+  @@map("workspaces")
+}
+
+model WorkspaceInviteToken {
+  id          String    @id @default(uuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  token       String    @unique
+  isUsed      Boolean   @default(false)
+  usedBy      String?
+  usedAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([workspaceId])
+  @@map("workspace_invite_tokens")
+}
+
+model WorkspaceMember {
+  id          String    @id @default(uuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId      String    @unique
+  user        User      @relation("WorkspaceMembership", fields: [userId], references: [id], onDelete: Cascade)
+  role        String    @default("MEMBER") // "LEADER" | "MEMBER" | "AGENT"
+  joinedAt    DateTime  @default(now())
+
+  @@index([workspaceId])
+  @@map("workspace_members")
+}
+
+model Ticket {
+  id              String        @id @default(uuid())
+  ticketNumber    Int           @unique @default(autoincrement())
+  title           String
+  description     String
+  status          TicketStatus  @default(NEW)
+  priority        Priority      @default(MEDIUM)
+  sentiment       Sentiment     @default(NEUTRAL)
+  tags            String[]      @default([])
+  customerName    String?
+
+  workspaceId     String?
+  workspace       Workspace?    @relation("WorkspaceTickets", fields: [workspaceId], references: [id], onDelete: SetNull)
+
+  customerId      String
+  customer        User          @relation("CustomerTickets", fields: [customerId], references: [id])
+
+  assignedAgentId String?
+  assignedAgent   User?         @relation("AgentTickets", fields: [assignedAgentId], references: [id])
+
+  messages        Message[]
+  auditLogs       AuditLog[]
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([workspaceId])
+  @@index([status, priority])
+  @@index([customerId])
+  @@index([assignedAgentId])
+  @@map("tickets")
+}
+
+model Message {
+  id          String      @id @default(uuid())
+  ticketId    String
+  ticket      Ticket      @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderId    String
+  sender      User        @relation(fields: [senderId], references: [id])
+  type        MessageType @default(PUBLIC_REPLY)
+  content     String
+  aiGenerated Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+
+  @@index([ticketId])
+  @@map("messages")
+}
+
+model KnowledgeArticle {
+  id        String   @id @default(uuid())
+  title     String
+  content   String
+  category  String
+  tags      String[] @default([])
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("knowledge_articles")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  ticketId  String
+  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  actorId   String
+  actor     User     @relation(fields: [actorId], references: [id])
+  action    String
+  details   Json?
+  createdAt DateTime @default(now())
+
+  @@index([ticketId])
+  @@map("audit_logs")
+}
