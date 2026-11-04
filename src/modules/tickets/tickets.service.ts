@@ -104,6 +104,7 @@ export class TicketsService {
         name: p.name,
         category: p.podCategory,
         description: p.description,
+        services: p.services,
         isCatchAll: p.isCatchAll,
       }));
       if (pods[0]?.organization?.industry) {

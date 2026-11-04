@@ -38,4 +38,38 @@ export class AuthController {
   async updateAvatar(@Body() dto: UpdateAvatarDto) {
     return this.authService.updateAvatar(dto);
   }
+
+  @Post('heartbeat')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Ping user presence heartbeat' })
+  async heartbeat(@Body('userId') userId: string) {
+    if (!userId) return { success: false, error: 'userId is required' };
+    return this.authService.heartbeat(userId);
+  }
+
+  @Post('session-start')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Start a user activity session upon login' })
+  async startSession(
+    @Body() body: { userId: string; role?: string; workspaceId?: string },
+  ) {
+    if (!body?.userId) return { success: false, error: 'userId is required' };
+    return this.authService.startSession(body.userId, body.role, body.workspaceId);
+  }
+
+  @Post('logout')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Logout and terminate active user presence session' })
+  async logout(@Body() body: { userId: string; reason?: string }) {
+    if (!body?.userId) return { success: false, error: 'userId is required' };
+    return this.authService.logoutSession(body.userId, body.reason || 'MANUAL_LOGOUT');
+  }
+
+  @Post('beacon-logout')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Browser beacon close session' })
+  async beaconLogout(@Body() body: { userId: string }) {
+    if (!body?.userId) return { success: false };
+    return this.authService.logoutSession(body.userId, 'BROWSER_CLOSED');
+  }
 }

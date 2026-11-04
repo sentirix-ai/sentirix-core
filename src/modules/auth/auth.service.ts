@@ -92,6 +92,104 @@ export class AuthService implements OnModuleInit {
     }
   }
 
+  /**
+   * Start User Activity Session for Presence Tracking
+   */
+  async startSession(userId: string, role?: string, workspaceId?: string) {
+    try {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        include: { workspaceMembership: true },
+      });
+      if (!user) return null;
+
+      // Close previous unclosed sessions as UNEXPECTED_DISCONNECT if lastHeartbeatAt older than 45s
+      const cutoff = new Date(Date.now() - 45000);
+      await this.prisma.userActivitySession.updateMany({
+        where: {
+          userId,
+          isOnline: true,
+          lastHeartbeatAt: { lt: cutoff },
+        },
+        data: {
+          isOnline: false,
+          logoutAt: new Date(),
+          logoutReason: 'UNEXPECTED_DISCONNECT',
+        },
+      });
+
+      const effectiveRole =
+        role ||
+        (user.workspaceMembership?.role === 'LEADER'
+          ? 'LEADER'
+          : user.role === 'ADMIN'
+            ? 'SUPER_ADMIN'
+            : 'AGENT');
+      const effectiveWorkspaceId =
+        workspaceId || user.workspaceMembership?.workspaceId || null;
+
+      const session = await this.prisma.userActivitySession.create({
+        data: {
+          userId,
+          organizationId: user.organizationId,
+          workspaceId: effectiveWorkspaceId,
+          role: effectiveRole,
+          loginAt: new Date(),
+          lastHeartbeatAt: new Date(),
+          isOnline: true,
+        },
+      });
+      return session;
+    } catch (e) {
+      this.logger.error(`Failed to start activity session: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Heartbeat ping every 15-20s from active browser tab
+   */
+  async heartbeat(userId: string) {
+    try {
+      const activeSession = await this.prisma.userActivitySession.findFirst({
+        where: { userId, isOnline: true },
+        orderBy: { loginAt: 'desc' },
+      });
+
+      if (activeSession) {
+        await this.prisma.userActivitySession.update({
+          where: { id: activeSession.id },
+          data: { lastHeartbeatAt: new Date() },
+        });
+        return { success: true, sessionId: activeSession.id };
+      } else {
+        const newSession = await this.startSession(userId);
+        return { success: true, sessionId: newSession?.id };
+      }
+    } catch (e) {
+      return { success: false, error: (e as Error).message };
+    }
+  }
+
+  /**
+   * Clean Logout Session
+   */
+  async logoutSession(userId: string, reason = 'MANUAL_LOGOUT') {
+    try {
+      await this.prisma.userActivitySession.updateMany({
+        where: { userId, isOnline: true },
+        data: {
+          isOnline: false,
+          logoutAt: new Date(),
+          logoutReason: reason,
+        },
+      });
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: (e as Error).message };
+    }
+  }
+
   // Cryptographic SHA-256 hash
   hashPassword(password: string): string {
     return crypto.createHash('sha256').update(password).digest('hex');

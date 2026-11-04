@@ -1296,10 +1296,16 @@ export class WorkspaceService {
     const calculatedMax = totalSeats - lockedSeats - 1 - otherUnlockedPodsCount;
     const maxSubordinatesAllowed = Math.min(7, Math.max(1, calculatedMax));
 
-    const allowedOptions = Array.from(
-      { length: maxSubordinatesAllowed },
-      (_, i) => i + 1,
-    );
+    // Determine if this is the last pod to lock quota (other pod(s) have already locked quota and no other unlocked pods remain)
+    const isLastPod = otherUnlockedPodsCount === 0 && otherLockedPods.length > 0;
+
+    // If it is the last pod, ONLY leave the single exact maximum quota (no options below 1..5, no options above 7..)!
+    const allowedOptions = isLastPod
+      ? [maxSubordinatesAllowed]
+      : Array.from(
+          { length: maxSubordinatesAllowed },
+          (_, i) => i + 1,
+        );
 
     return {
       valid: true,
@@ -1324,6 +1330,7 @@ export class WorkspaceService {
         lockedSeats,
         lockedPodsCount: otherLockedPods.length,
         otherUnlockedPodsCount,
+        isLastPod,
         maxSubordinatesAllowed,
         allowedOptions,
       },
@@ -1355,11 +1362,9 @@ export class WorkspaceService {
       );
     }
 
-    if (chosenCount > quotaStatus.quotaStats.maxSubordinatesAllowed) {
-      throw new BadRequestException(
-        `Chosen quota (${chosenCount}) exceeds the current maximum allowed (${quotaStatus.quotaStats.maxSubordinatesAllowed}) based on remaining organization capacity.`,
-      );
-    }
+    const maxAllowed = quotaStatus.quotaStats.maxSubordinatesAllowed;
+    // Auto-clamp chosen count to available capacity so leader activation never crashes
+    const safeCount = Math.min(Math.max(1, chosenCount), maxAllowed);
 
     const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
       where: { token: cleanToken },
@@ -1406,7 +1411,7 @@ export class WorkspaceService {
     });
 
     // 4. Lock Workspace Quota
-    const totalPodQuota = 1 + chosenCount; // 1 Leader + M Agen
+    const totalPodQuota = 1 + safeCount; // 1 Leader + M Agen
     await this.prisma.workspace.update({
       where: { id: workspace.id },
       data: {
@@ -1416,6 +1421,70 @@ export class WorkspaceService {
         lockedAt: new Date(),
       },
     });
+
+    // Auto-lock neighboring pod if exactly 1 unlocked pod remains
+    if (workspace.organizationId) {
+      try {
+        const remainingUnlocked = await this.prisma.workspace.findMany({
+          where: {
+            organizationId: workspace.organizationId,
+            isQuotaLocked: false,
+            id: { not: workspace.id },
+          },
+        });
+
+        if (remainingUnlocked.length === 1) {
+          const otherPod = remainingUnlocked[0];
+          const allLocked = await this.prisma.workspace.findMany({
+            where: {
+              organizationId: workspace.organizationId,
+              isQuotaLocked: true,
+            },
+          });
+          const currentLockedSum = allLocked.reduce(
+            (sum, p) => sum + p.assignedQuota,
+            0,
+          );
+          const orgTotal =
+            quotaStatus.organization?.totalSeats ||
+            quotaStatus.quotaStats.totalSeats ||
+            20;
+          const remainder = Math.max(1, orgTotal - currentLockedSum);
+
+          await this.prisma.workspace.update({
+            where: { id: otherPod.id },
+            data: {
+              assignedQuota: remainder,
+              maxMembers: remainder,
+              isQuotaLocked: true,
+              lockedAt: new Date(),
+            },
+          });
+          this.logger.log(
+            `Auto-locked neighboring Pod "${otherPod.name}" with remaining quota: ${remainder} seats.`,
+          );
+        }
+      } catch (autoLockErr) {
+        this.logger.warn(`Could not auto-lock neighboring pod: ${(autoLockErr as Error)?.message}`);
+      }
+    }
+
+    // Start activity session for leader
+    try {
+      await this.prisma.userActivitySession.create({
+        data: {
+          userId: leaderUser.id,
+          organizationId: workspace.organizationId,
+          workspaceId: workspace.id,
+          role: 'LEADER',
+          loginAt: new Date(),
+          lastHeartbeatAt: new Date(),
+          isOnline: true,
+        },
+      });
+    } catch (sessionErr) {
+      this.logger.warn(`Failed to create leader activity session: ${(sessionErr as Error)?.message}`);
+    }
 
     // 5. Mark Leader Token as Used (Single-Use Constraint)
     await this.prisma.workspaceInviteToken.update({
@@ -1427,9 +1496,9 @@ export class WorkspaceService {
       },
     });
 
-    // 6. Auto-generate exactly chosenCount Single-Use Agent Tokens
+    // 6. Auto-generate exactly safeCount Single-Use Agent Tokens
     const agentTokens: any[] = [];
-    for (let i = 0; i < chosenCount; i++) {
+    for (let i = 0; i < safeCount; i++) {
       const agtTokenStr =
         'STX-AGT-' + crypto.randomBytes(3).toString('hex').toUpperCase();
       const agt = await this.prisma.workspaceInviteToken.create({
@@ -1447,15 +1516,23 @@ export class WorkspaceService {
     }
 
     this.logger.log(
-      `Leader "${cleanName}" locked Pod "${workspace.name}" with 1 leader + ${chosenCount} agents. Generated ${agentTokens.length} single-use agent tokens.`,
+      `Leader "${cleanName}" locked Pod "${workspace.name}" with 1 leader + ${safeCount} agents. Generated ${agentTokens.length} single-use agent tokens.`,
     );
 
-    // 7. Emit WebSocket event for real-time quota sync
+    // 7. Emit WebSocket event for real-time quota sync and leader activation
     try {
       this.eventsGateway.server?.emit('workspace:quota-locked', {
         workspaceId: workspace.id,
         organizationId: workspace.organizationId,
         lockedPodQuota: totalPodQuota,
+      });
+      this.eventsGateway.server?.emit('leader:activated', {
+        leaderName: cleanName,
+        podName: workspace.name,
+        workspaceId: workspace.id,
+        organizationId: workspace.organizationId,
+        agentQuota: safeCount,
+        timestamp: new Date().toISOString(),
       });
     } catch {
       // ignore websocket failure
@@ -1631,6 +1708,23 @@ export class WorkspaceService {
       },
     });
 
+    // Start activity session for agent
+    try {
+      await this.prisma.userActivitySession.create({
+        data: {
+          userId: agentUser.id,
+          organizationId: workspace.organizationId,
+          workspaceId: workspace.id,
+          role: 'AGENT',
+          loginAt: new Date(),
+          lastHeartbeatAt: new Date(),
+          isOnline: true,
+        },
+      });
+    } catch (sessionErr) {
+      this.logger.warn(`Failed to create agent activity session: ${(sessionErr as Error)?.message}`);
+    }
+
     try {
       this.eventsGateway.server?.emit('workspace:member-joined', {
         workspaceId: workspace.id,
@@ -1725,20 +1819,22 @@ export class WorkspaceService {
         }
       });
 
-      // Collect tokens for audit
-      ws.inviteTokens.forEach((tok) => {
-        tokenAudit.push({
-          id: tok.id,
-          token: tok.token,
-          role: tok.role,
-          podName: ws.name,
-          workspaceId: ws.id,
-          isUsed: tok.isUsed,
-          usedBy: tok.usedBy,
-          usedAt: tok.usedAt,
-          createdAt: tok.createdAt,
+      // Collect tokens for audit (only active tokens, exclude revoked ones)
+      ws.inviteTokens
+        .filter((tok) => tok.usedBy !== 'REVOKED_FOR_REGENERATION')
+        .forEach((tok) => {
+          tokenAudit.push({
+            id: tok.id,
+            token: tok.token,
+            role: tok.role,
+            podName: ws.name,
+            workspaceId: ws.id,
+            isUsed: tok.isUsed,
+            usedBy: tok.usedBy,
+            usedAt: tok.usedAt,
+            createdAt: tok.createdAt,
+          });
         });
-      });
 
       return {
         id: ws.id,
@@ -1759,6 +1855,175 @@ export class WorkspaceService {
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
 
+    // Query presence and activity sessions for Leader & Member monitoring
+    const allOrgUsers = await this.prisma.user.findMany({
+      where: {
+        OR: [
+          { organizationId: org.id },
+          { id: user.id },
+        ],
+      },
+      include: {
+        workspaceMembership: {
+          include: { workspace: true },
+        },
+        activitySessions: {
+          orderBy: { loginAt: 'desc' },
+          take: 30,
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const now = Date.now();
+    const presenceList = allOrgUsers.map((u) => {
+      const isSuperAdmin = u.role === 'ADMIN' || u.id === user.id;
+      const isLeader = u.workspaceMembership?.role === 'LEADER';
+      const userRole = isSuperAdmin ? 'SUPER_ADMIN' : isLeader ? 'LEADER' : 'MEMBER';
+      const podName =
+        u.workspaceMembership?.workspace?.name ||
+        (isSuperAdmin ? 'Executive Cockpit' : 'Belum Ditugaskan');
+
+      const latestSession = u.activitySessions[0] || null;
+      // Active session: isOnline = true and heartbeat within last 45 seconds
+      const isActuallyOnline = !!(
+        latestSession &&
+        latestSession.isOnline &&
+        now - new Date(latestSession.lastHeartbeatAt).getTime() < 45000
+      );
+
+      // Current online duration in seconds
+      let currentOnlineSeconds = 0;
+      if (isActuallyOnline && latestSession) {
+        currentOnlineSeconds = Math.max(
+          0,
+          Math.floor((now - new Date(latestSession.loginAt).getTime()) / 1000),
+        );
+      }
+
+      // Check if there was an unexpected disconnect
+      let hadUnexpectedDisconnect = false;
+      let unexpectedDisconnectTime: Date | null = null;
+      let reconnectedTime: Date | null = null;
+      let disconnectDowntimeSeconds = 0;
+
+      for (let i = 0; i < u.activitySessions.length; i++) {
+        const sess = u.activitySessions[i];
+        if (
+          sess.logoutReason === 'UNEXPECTED_DISCONNECT' ||
+          sess.logoutReason === 'BROWSER_CLOSED'
+        ) {
+          hadUnexpectedDisconnect = true;
+          unexpectedDisconnectTime = sess.logoutAt || sess.lastHeartbeatAt;
+          if (i > 0) {
+            const nextSess = u.activitySessions[i - 1];
+            reconnectedTime = nextSess.loginAt;
+            disconnectDowntimeSeconds = Math.max(
+              0,
+              Math.floor(
+                (new Date(nextSess.loginAt).getTime() -
+                  new Date(unexpectedDisconnectTime).getTime()) /
+                  1000,
+              ),
+            );
+          }
+          break;
+        }
+      }
+
+      const sessionHistory = u.activitySessions.map((sess, sIdx) => {
+        const durationSec = sess.logoutAt
+          ? Math.max(
+              0,
+              Math.floor(
+                (new Date(sess.logoutAt).getTime() -
+                  new Date(sess.loginAt).getTime()) /
+                  1000,
+              ),
+            )
+          : Math.max(
+              0,
+              Math.floor((now - new Date(sess.loginAt).getTime()) / 1000),
+            );
+
+        let reconnectedAt: Date | null = null;
+        if (sIdx > 0) {
+          reconnectedAt = u.activitySessions[sIdx - 1].loginAt;
+        }
+
+        return {
+          id: sess.id,
+          loginAt: sess.loginAt,
+          logoutAt: sess.logoutAt,
+          logoutReason:
+            sess.logoutReason ||
+            (sess.isOnline ? 'SESI_AKTIF' : 'UNEXPECTED_DISCONNECT'),
+          isOnline: sess.isOnline,
+          durationSeconds: durationSec,
+          reconnectedAt,
+        };
+      });
+
+      return {
+        userId: u.id,
+        fullName: u.fullName,
+        username: u.username,
+        role: userRole,
+        podName,
+        isOnline: isActuallyOnline,
+        status: isActuallyOnline
+          ? 'ONLINE'
+          : latestSession?.logoutReason === 'UNEXPECTED_DISCONNECT'
+            ? 'TERPUTUS'
+            : 'OFFLINE',
+        currentOnlineSeconds,
+        latestLoginAt: latestSession?.loginAt || null,
+        latestLogoutAt: latestSession?.logoutAt || null,
+        hadUnexpectedDisconnect,
+        unexpectedDisconnectTime,
+        reconnectedTime,
+        disconnectDowntimeSeconds,
+        sessionHistory,
+      };
+    });
+
+    // Enrich tokenAudit with real-time user online/logout status for the "DIKELOLA" column
+    const enrichedTokenAudit = tokenAudit.map((tok) => {
+      if (!tok.isUsed || !tok.usedBy) {
+        return {
+          ...tok,
+          isUserOnline: false,
+          userStatus: 'UNCLAIMED',
+        };
+      }
+      const matched = presenceList.find(
+        (p) =>
+          p.fullName?.toLowerCase() === tok.usedBy.toLowerCase() ||
+          p.username?.toLowerCase() === tok.usedBy.toLowerCase(),
+      );
+      return {
+        ...tok,
+        isUserOnline: matched ? matched.isOnline : false,
+        userStatus: matched ? (matched.isOnline ? 'ONLINE' : 'LOGOUT') : 'LOGOUT',
+      };
+    });
+
+    const recentLeaderActivations = workspaces
+      .map((ws) => {
+        const leader = ws.members.find((m) => m.role === 'LEADER');
+        if (!leader || !leader.user) return null;
+        return {
+          workspaceId: ws.id,
+          podName: ws.name,
+          leaderName: leader.user.fullName || leader.user.username,
+          joinedAt: leader.joinedAt,
+          isQuotaLocked: ws.isQuotaLocked,
+          assignedQuota: ws.assignedQuota,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null)
+      .sort((a, b) => new Date(b.joinedAt).getTime() - new Date(a.joinedAt).getTime());
+
     return {
       organization: {
         id: org.id,
@@ -1778,10 +2043,13 @@ export class WorkspaceService {
         totalPods: workspaces.length,
         lockedPods: totalLockedPods,
         crisisCount: crisisTickets.length,
+        onlineCount: presenceList.filter((p) => p.isOnline).length,
       },
       workspaces: podsData,
-      tokenAudit,
+      tokenAudit: enrichedTokenAudit,
       crisisTickets,
+      presenceMonitoring: presenceList,
+      recentLeaderActivations,
     };
   }
 
@@ -1804,27 +2072,19 @@ export class WorkspaceService {
       throw new NotFoundException('Token not found.');
     }
 
-    // Invalidate old token
-    await this.prisma.workspaceInviteToken.update({
-      where: { id: tokenRecord.id },
-      data: {
-        isUsed: true,
-        usedBy: 'REVOKED_FOR_REGENERATION',
-        usedAt: new Date(),
-      },
-    });
-
     // Generate new token string
     const prefix = tokenRecord.role === 'LEADER' ? 'STX-LDR-' : 'STX-AGT-';
     const newTokenStr =
       prefix + crypto.randomBytes(3).toString('hex').toUpperCase();
 
-    await this.prisma.workspaceInviteToken.create({
+    // Update the existing token in-place to avoid bloated duplicate rows
+    await this.prisma.workspaceInviteToken.update({
+      where: { id: tokenRecord.id },
       data: {
-        workspaceId: tokenRecord.workspaceId,
         token: newTokenStr,
-        role: tokenRecord.role,
         isUsed: false,
+        usedBy: null,
+        usedAt: null,
       },
     });
 
