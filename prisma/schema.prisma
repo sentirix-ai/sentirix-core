@@ -91,9 +91,13 @@ model Workspace {
   name           String
   podCategory    String                 @default("GENERAL") // "TRACKING", "BILLING", "CLAIMS", "TECHNICAL", "CUSTOM", etc.
   description    String?                // Semantic keywords for AI Triage
+  services       String[]               @default([]) // Services handled by this pod
   isCatchAll     Boolean                @default(false)
   inviteToken    String                 @default(uuid())
   maxMembers     Int                    @default(8)
+  assignedQuota  Int                    @default(8) // Capacity locked by leader (1 Leader + M agents)
+  isQuotaLocked  Boolean                @default(false) // True when leader clicks [✓]
+  lockedAt       DateTime?
 
   ownerId        String
   owner          User                   @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
@@ -118,11 +122,14 @@ model WorkspaceInviteToken {
   workspaceId String
   workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   token       String    @unique
+  role        String    @default("LEADER") // "LEADER" | "AGENT"
   isUsed      Boolean   @default(false)
   usedBy      String?
   usedAt      DateTime?
+  expiresAt   DateTime?
   createdAt   DateTime  @default(now())
 
+  @@index([token])
   @@index([workspaceId])
   @@map("workspace_invite_tokens")
 }

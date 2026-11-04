@@ -172,4 +172,107 @@ export class WorkspaceController {
     }
     return this.workspaceService.createCustomPod(identifier, dto);
   }
+
+  /**
+   * Enterprise Multi-Pod Provisioning v2 (Titanium Onboarding)
+   */
+  @Post('setup-multi-pod-v2')
+  async setupMultiPodV2(
+    @Body()
+    dto: {
+      identifier: string;
+      organizationName?: string;
+      industry: string;
+      customIndustryDescription?: string;
+      totalSeats: number;
+      leadershipMode?: 'UNIFIED' | 'DEDICATED';
+      pods: Array<{
+        name: string;
+        podCategory: string;
+        description?: string;
+        services?: string[];
+        seats?: number;
+      }>;
+    },
+  ) {
+    if (!dto.identifier) {
+      throw new BadRequestException('User identifier is required.');
+    }
+    return this.workspaceService.setupMultiPodV2(dto);
+  }
+
+  /**
+   * Get dynamic interconnected quota status for a Leader token
+   */
+  @Get('leader-token-status/:token')
+  async getLeaderTokenStatus(@Param('token') token: string) {
+    if (!token) {
+      throw new BadRequestException('Token is required.');
+    }
+    return this.workspaceService.getLeaderTokenQuotaStatus(token);
+  }
+
+  /**
+   * Lock Leader Quota (Click Checkmark [✓]) & Auto-Generate Single-Use Agent Tokens
+   */
+  @Post('lock-leader-quota')
+  async lockLeaderQuota(
+    @Body()
+    dto: {
+      token: string;
+      fullName: string;
+      password?: string;
+      chosenSubordinates: number;
+    },
+  ) {
+    return this.workspaceService.lockLeaderQuota(dto);
+  }
+
+  /**
+   * Validate Agent Single-Use Token
+   */
+  @Get('agent-token-status/:token')
+  async getAgentTokenStatus(@Param('token') token: string) {
+    if (!token) {
+      throw new BadRequestException('Token is required.');
+    }
+    return this.workspaceService.getAgentTokenStatus(token);
+  }
+
+  /**
+   * Claim Agent Single-Use Token and Join Pod
+   */
+  @Post('claim-agent-token')
+  async claimAgentToken(
+    @Body()
+    dto: {
+      token: string;
+      fullName: string;
+      password?: string;
+    },
+  ) {
+    return this.workspaceService.claimAgentToken(dto);
+  }
+
+  /**
+   * Get Super Admin Executive Cockpit Data
+   */
+  @Get('super-admin-cockpit')
+  async getSuperAdminCockpit(@Query('identifier') identifier: string) {
+    if (!identifier) {
+      throw new BadRequestException('Administrator identifier is required.');
+    }
+    return this.workspaceService.getSuperAdminCockpitData(identifier);
+  }
+
+  /**
+   * Regenerate Single-Use Token for Leader or Agent
+   */
+  @Post('regenerate-token')
+  async regenerateToken(@Body('token') token: string) {
+    if (!token) {
+      throw new BadRequestException('Token string is required.');
+    }
+    return this.workspaceService.regenerateToken(token);
+  }
 }

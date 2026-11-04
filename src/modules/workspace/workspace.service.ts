@@ -1045,4 +1045,809 @@ export class WorkspaceService {
       },
     };
   }
+
+  /**
+   * Enterprise Multi-Pod Provisioning v2 (Titanium Onboarding)
+   * With Single-Use Leader Tokens and Multi-Service Mapping
+   */
+  async setupMultiPodV2(dto: {
+    identifier: string;
+    organizationName?: string;
+    industry: string;
+    customIndustryDescription?: string;
+    totalSeats: number;
+    leadershipMode?: 'UNIFIED' | 'DEDICATED';
+    pods: Array<{
+      name: string;
+      podCategory: string;
+      description?: string;
+      services?: string[];
+      seats?: number;
+    }>;
+  }) {
+    this.assertNotAdmin(dto.identifier);
+
+    const user = await this.prisma.user.findFirst({
+      where: {
+        OR: [
+          { id: dto.identifier },
+          { username: { equals: dto.identifier, mode: 'insensitive' } },
+          { email: { equals: dto.identifier, mode: 'insensitive' } },
+        ],
+      },
+      include: { organization: true },
+    });
+
+    if (!user) {
+      throw new NotFoundException(`User ${dto.identifier} not found.`);
+    }
+
+    const orgName =
+      dto.organizationName?.trim() ||
+      `${user.fullName || user.username}'s Organization`;
+
+    // 1. Create or Update Organization
+    let organization = user.organization;
+    if (!organization) {
+      organization = await this.prisma.organization.create({
+        data: {
+          name: orgName,
+          industry: dto.industry || 'OTHER',
+          customIndustryDescription: dto.customIndustryDescription || null,
+          totalSeats: Number(dto.totalSeats) || 20,
+          leadershipMode: dto.leadershipMode || 'DEDICATED',
+        },
+      });
+    } else {
+      organization = await this.prisma.organization.update({
+        where: { id: organization.id },
+        data: {
+          name: orgName,
+          industry: dto.industry || organization.industry,
+          customIndustryDescription:
+            dto.customIndustryDescription || organization.customIndustryDescription,
+          totalSeats: Number(dto.totalSeats) || organization.totalSeats,
+          leadershipMode: dto.leadershipMode || organization.leadershipMode,
+        },
+      });
+    }
+
+    // 2. Link User to Organization as ADMIN
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        organizationId: organization.id,
+        role: 'ADMIN',
+        onboardingCompleted: true,
+      },
+    });
+
+    // 3. Remove existing old workspaces for clean setup
+    await this.prisma.workspace.deleteMany({
+      where: { organizationId: organization.id },
+    });
+
+    // 4. Create Pods with Single-Use Leader Tokens
+    const configuredPods =
+      dto.pods && dto.pods.length > 0
+        ? dto.pods
+        : [
+            {
+              name: 'General Support Pod',
+              podCategory: 'GENERAL',
+              description: 'General customer inquiries',
+              services: ['General Support'],
+            },
+          ];
+
+    const createdWorkspaces: any[] = [];
+    const leaderTokens: any[] = [];
+
+    for (const pod of configuredPods) {
+      const leaderTokenStr =
+        'STX-LDR-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+
+      const ws = await this.prisma.workspace.create({
+        data: {
+          name: pod.name,
+          podCategory: pod.podCategory || 'GENERAL',
+          description: pod.description || null,
+          services: pod.services || [],
+          maxMembers: 8,
+          assignedQuota: 8,
+          isQuotaLocked: false,
+          inviteToken: leaderTokenStr,
+          ownerId: user.id,
+          organizationId: organization.id,
+          inviteTokens: {
+            create: {
+              token: leaderTokenStr,
+              role: 'LEADER',
+              isUsed: false,
+            },
+          },
+        },
+        include: {
+          inviteTokens: true,
+        },
+      });
+
+      createdWorkspaces.push(ws);
+      leaderTokens.push({
+        workspaceId: ws.id,
+        workspaceName: ws.name,
+        podCategory: ws.podCategory,
+        services: ws.services,
+        token: leaderTokenStr,
+        role: 'LEADER',
+        isUsed: false,
+        joinUrl: `http://localhost:3000/join?token=${leaderTokenStr}`,
+      });
+    }
+
+    this.logger.log(
+      `Provisioned v2 ${createdWorkspaces.length} pods with single-use leader tokens for ${organization.name}`,
+    );
+
+    return {
+      success: true,
+      organization: {
+        id: organization.id,
+        name: organization.name,
+        industry: organization.industry,
+        totalSeats: organization.totalSeats,
+        leadershipMode: organization.leadershipMode,
+      },
+      pods: createdWorkspaces.map((w) => ({
+        id: w.id,
+        name: w.name,
+        podCategory: w.podCategory,
+        description: w.description,
+        services: w.services,
+        isQuotaLocked: w.isQuotaLocked,
+        assignedQuota: w.assignedQuota,
+      })),
+      leaderTokens,
+    };
+  }
+
+  /**
+   * Get dynamic interconnected quota status for a Leader token
+   */
+  async getLeaderTokenQuotaStatus(token: string) {
+    if (!token || token.trim() === '') {
+      throw new BadRequestException('Token is required.');
+    }
+    const cleanToken = token.trim();
+
+    const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
+      where: { token: cleanToken },
+      include: {
+        workspace: {
+          include: {
+            organization: true,
+            members: { include: { user: true } },
+          },
+        },
+      },
+    });
+
+    if (!tokenRecord) {
+      return {
+        valid: false,
+        error: 'Invalid or unknown invitation token.',
+      };
+    }
+
+    if (tokenRecord.role !== 'LEADER') {
+      return {
+        valid: false,
+        error: 'This token is not a Leader activation token.',
+      };
+    }
+
+    if (tokenRecord.isUsed) {
+      return {
+        valid: false,
+        isUsed: true,
+        error: `This leader activation token has already been claimed by ${tokenRecord.usedBy || 'another user'} on ${tokenRecord.usedAt ? new Date(tokenRecord.usedAt).toLocaleString() : 'earlier'}. Each token can only be claimed once.`,
+        workspaceName: tokenRecord.workspace?.name,
+      };
+    }
+
+    const currentWorkspace = tokenRecord.workspace;
+    const organization = currentWorkspace?.organization;
+
+    if (!organization) {
+      return {
+        valid: false,
+        error: 'Associated organization not found.',
+      };
+    }
+
+    // Fetch all workspaces in this organization
+    const allPods = await this.prisma.workspace.findMany({
+      where: { organizationId: organization.id },
+      include: {
+        members: { include: { user: true } },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const totalSeats = organization.totalSeats || 20;
+    const totalPods = allPods.length;
+
+    // Filter pods locked by other leaders
+    const otherLockedPods = allPods.filter(
+      (p) => p.isQuotaLocked && p.id !== currentWorkspace.id,
+    );
+    const lockedSeats = otherLockedPods.reduce(
+      (sum, p) => sum + p.assignedQuota,
+      0,
+    );
+
+    // Other unlocked pods (excluding this current pod)
+    const otherUnlockedPodsCount = allPods.filter(
+      (p) => !p.isQuotaLocked && p.id !== currentWorkspace.id,
+    ).length;
+
+    // Interconnected quota formula:
+    // M_k^max = min(7, max(1, totalSeats - lockedSeats - 1 - otherUnlockedPodsCount))
+    const calculatedMax = totalSeats - lockedSeats - 1 - otherUnlockedPodsCount;
+    const maxSubordinatesAllowed = Math.min(7, Math.max(1, calculatedMax));
+
+    const allowedOptions = Array.from(
+      { length: maxSubordinatesAllowed },
+      (_, i) => i + 1,
+    );
+
+    return {
+      valid: true,
+      token: tokenRecord.token,
+      role: 'LEADER',
+      workspace: {
+        id: currentWorkspace.id,
+        name: currentWorkspace.name,
+        podCategory: currentWorkspace.podCategory,
+        services: currentWorkspace.services,
+        isQuotaLocked: currentWorkspace.isQuotaLocked,
+        assignedQuota: currentWorkspace.assignedQuota,
+      },
+      organization: {
+        id: organization.id,
+        name: organization.name,
+        totalSeats,
+      },
+      quotaStats: {
+        totalSeats,
+        totalPods,
+        lockedSeats,
+        lockedPodsCount: otherLockedPods.length,
+        otherUnlockedPodsCount,
+        maxSubordinatesAllowed,
+        allowedOptions,
+      },
+    };
+  }
+
+  /**
+   * Lock Leader Quota (Click Checkmark [✓]) & Auto-Generate Single-Use Agent Tokens
+   */
+  async lockLeaderQuota(dto: {
+    token: string;
+    fullName: string;
+    password?: string;
+    chosenSubordinates: number;
+  }) {
+    const { token, fullName, password, chosenSubordinates } = dto;
+    if (!token || !fullName || fullName.trim().length < 2) {
+      throw new BadRequestException('Please provide a valid token and full name.');
+    }
+    const cleanToken = token.trim();
+    const cleanName = fullName.trim();
+    const chosenCount = Number(chosenSubordinates) || 1;
+
+    // 1. Verify token & quota limits
+    const quotaStatus = await this.getLeaderTokenQuotaStatus(cleanToken);
+    if (!quotaStatus.valid || !quotaStatus.quotaStats) {
+      throw new BadRequestException(
+        (quotaStatus as any).error || 'Token is not valid.',
+      );
+    }
+
+    if (chosenCount > quotaStatus.quotaStats.maxSubordinatesAllowed) {
+      throw new BadRequestException(
+        `Chosen quota (${chosenCount}) exceeds the current maximum allowed (${quotaStatus.quotaStats.maxSubordinatesAllowed}) based on remaining organization capacity.`,
+      );
+    }
+
+    const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
+      where: { token: cleanToken },
+      include: { workspace: true },
+    });
+
+    if (!tokenRecord) {
+      throw new NotFoundException('Token record not found.');
+    }
+
+    const workspace = tokenRecord.workspace;
+
+    // 2. Create Leader User Account
+    const slug = cleanName
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .slice(0, 10);
+    const username = `${slug || 'leader'}_${Math.floor(1000 + Math.random() * 9000)}`;
+    const email = `${username}@team.${workspace.id.slice(0, 8)}.sentrix.local`;
+    const passwordHash =
+      password && password.trim() !== ''
+        ? crypto.createHash('sha256').update(password.trim()).digest('hex')
+        : crypto.createHash('sha256').update('0o0o 0o0o').digest('hex');
+
+    const leaderUser = await this.prisma.user.create({
+      data: {
+        username,
+        fullName: cleanName,
+        email,
+        passwordHash,
+        role: 'AGENT',
+        organizationId: workspace.organizationId,
+        onboardingCompleted: true,
+      },
+    });
+
+    // 3. Bind Leader to Workspace
+    await this.prisma.workspaceMember.create({
+      data: {
+        workspaceId: workspace.id,
+        userId: leaderUser.id,
+        role: 'LEADER',
+      },
+    });
+
+    // 4. Lock Workspace Quota
+    const totalPodQuota = 1 + chosenCount; // 1 Leader + M Agen
+    await this.prisma.workspace.update({
+      where: { id: workspace.id },
+      data: {
+        assignedQuota: totalPodQuota,
+        maxMembers: totalPodQuota,
+        isQuotaLocked: true,
+        lockedAt: new Date(),
+      },
+    });
+
+    // 5. Mark Leader Token as Used (Single-Use Constraint)
+    await this.prisma.workspaceInviteToken.update({
+      where: { id: tokenRecord.id },
+      data: {
+        isUsed: true,
+        usedBy: cleanName,
+        usedAt: new Date(),
+      },
+    });
+
+    // 6. Auto-generate exactly chosenCount Single-Use Agent Tokens
+    const agentTokens: any[] = [];
+    for (let i = 0; i < chosenCount; i++) {
+      const agtTokenStr =
+        'STX-AGT-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+      const agt = await this.prisma.workspaceInviteToken.create({
+        data: {
+          workspaceId: workspace.id,
+          token: agtTokenStr,
+          role: 'AGENT',
+          isUsed: false,
+        },
+      });
+      agentTokens.push({
+        token: agt.token,
+        joinUrl: `http://localhost:3000/join?token=${agt.token}`,
+      });
+    }
+
+    this.logger.log(
+      `Leader "${cleanName}" locked Pod "${workspace.name}" with 1 leader + ${chosenCount} agents. Generated ${agentTokens.length} single-use agent tokens.`,
+    );
+
+    // 7. Emit WebSocket event for real-time quota sync
+    try {
+      this.eventsGateway.server?.emit('workspace:quota-locked', {
+        workspaceId: workspace.id,
+        organizationId: workspace.organizationId,
+        lockedPodQuota: totalPodQuota,
+      });
+    } catch {
+      // ignore websocket failure
+    }
+
+    return {
+      success: true,
+      leader: {
+        id: leaderUser.id,
+        username: leaderUser.username,
+        fullName: leaderUser.fullName,
+        email: leaderUser.email,
+        role: 'LEADER',
+      },
+      workspace: {
+        id: workspace.id,
+        name: workspace.name,
+        assignedQuota: totalPodQuota,
+        isQuotaLocked: true,
+      },
+      agentTokens,
+    };
+  }
+
+  /**
+   * Validate Agent Single-Use Token
+   */
+  async getAgentTokenStatus(token: string) {
+    if (!token || token.trim() === '') {
+      throw new BadRequestException('Token is required.');
+    }
+    const cleanToken = token.trim();
+
+    const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
+      where: { token: cleanToken },
+      include: {
+        workspace: {
+          include: {
+            organization: true,
+            members: {
+              where: { role: 'LEADER' },
+              include: { user: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!tokenRecord) {
+      return {
+        valid: false,
+        error: 'Invalid or unknown agent invitation token.',
+      };
+    }
+
+    if (tokenRecord.role !== 'AGENT') {
+      return {
+        valid: false,
+        error: 'This token is not an agent invitation token.',
+      };
+    }
+
+    if (tokenRecord.isUsed) {
+      return {
+        valid: false,
+        isUsed: true,
+        error: `This agent token has already been claimed by ${tokenRecord.usedBy || 'another team member'} on ${tokenRecord.usedAt ? new Date(tokenRecord.usedAt).toLocaleString() : 'earlier'}. Each token can only be claimed once.`,
+        workspaceName: tokenRecord.workspace?.name,
+      };
+    }
+
+    const leaderMember = tokenRecord.workspace?.members[0];
+
+    return {
+      valid: true,
+      token: tokenRecord.token,
+      role: 'AGENT',
+      workspace: {
+        id: tokenRecord.workspace?.id,
+        name: tokenRecord.workspace?.name,
+        podCategory: tokenRecord.workspace?.podCategory,
+        services: tokenRecord.workspace?.services,
+      },
+      organization: {
+        id: tokenRecord.workspace?.organization?.id,
+        name: tokenRecord.workspace?.organization?.name,
+      },
+      leaderName: leaderMember?.user?.fullName || 'Pod Leader',
+    };
+  }
+
+  /**
+   * Claim Agent Single-Use Token and Join Pod
+   */
+  async claimAgentToken(dto: {
+    token: string;
+    fullName: string;
+    password?: string;
+  }) {
+    const { token, fullName, password } = dto;
+    if (!token || !fullName || fullName.trim().length < 2) {
+      throw new BadRequestException('Please provide a valid token and full name.');
+    }
+    const cleanToken = token.trim();
+    const cleanName = fullName.trim();
+
+    const agentStatus = await this.getAgentTokenStatus(cleanToken);
+    if (!agentStatus.valid) {
+      throw new BadRequestException(agentStatus.error || 'Token is not valid.');
+    }
+
+    const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
+      where: { token: cleanToken },
+      include: {
+        workspace: {
+          include: { members: true },
+        },
+      },
+    });
+
+    if (!tokenRecord) {
+      throw new NotFoundException('Token not found.');
+    }
+
+    const workspace = tokenRecord.workspace;
+
+    if (workspace.members.length >= workspace.maxMembers) {
+      throw new BadRequestException(
+        `Pod capacity is already filled (${workspace.members.length}/${workspace.maxMembers} seats).`,
+      );
+    }
+
+    // Create Agent user
+    const slug = cleanName
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .slice(0, 10);
+    const username = `${slug || 'agent'}_${Math.floor(1000 + Math.random() * 9000)}`;
+    const email = `${username}@agent.${workspace.id.slice(0, 8)}.sentrix.local`;
+    const passwordHash =
+      password && password.trim() !== ''
+        ? crypto.createHash('sha256').update(password.trim()).digest('hex')
+        : crypto.createHash('sha256').update('0o0o 0o0o').digest('hex');
+
+    const agentUser = await this.prisma.user.create({
+      data: {
+        username,
+        fullName: cleanName,
+        email,
+        passwordHash,
+        role: 'AGENT',
+        organizationId: workspace.organizationId,
+        onboardingCompleted: true,
+      },
+    });
+
+    // Add to WorkspaceMember
+    await this.prisma.workspaceMember.create({
+      data: {
+        workspaceId: workspace.id,
+        userId: agentUser.id,
+        role: 'AGENT',
+      },
+    });
+
+    // Mark single-use token as consumed
+    await this.prisma.workspaceInviteToken.update({
+      where: { id: tokenRecord.id },
+      data: {
+        isUsed: true,
+        usedBy: cleanName,
+        usedAt: new Date(),
+      },
+    });
+
+    try {
+      this.eventsGateway.server?.emit('workspace:member-joined', {
+        workspaceId: workspace.id,
+        member: {
+          id: agentUser.id,
+          fullName: agentUser.fullName,
+          role: 'AGENT',
+        },
+      });
+    } catch {
+      // ignore
+    }
+
+    return {
+      success: true,
+      user: {
+        id: agentUser.id,
+        username: agentUser.username,
+        fullName: agentUser.fullName,
+        email: agentUser.email,
+        role: 'AGENT',
+      },
+      workspace: {
+        id: workspace.id,
+        name: workspace.name,
+      },
+    };
+  }
+
+  /**
+   * Super Admin Executive Control Cockpit Data
+   */
+  async getSuperAdminCockpitData(identifier: string) {
+    const user = await this.prisma.user.findFirst({
+      where: {
+        OR: [
+          { id: identifier },
+          { username: { equals: identifier, mode: 'insensitive' } },
+          { email: { equals: identifier, mode: 'insensitive' } },
+        ],
+      },
+      include: {
+        organization: {
+          include: {
+            workspaces: {
+              include: {
+                members: { include: { user: true } },
+                tickets: true,
+                inviteTokens: { orderBy: { createdAt: 'desc' } },
+              },
+              orderBy: { createdAt: 'asc' },
+            },
+          },
+        },
+      },
+    });
+
+    if (!user || !user.organization) {
+      throw new NotFoundException('Organization not found for this administrator.');
+    }
+
+    const org = user.organization;
+    const workspaces = org.workspaces || [];
+
+    // Calculate metrics
+    let totalClaimedSeats = 0;
+    let totalLockedPods = 0;
+    const tokenAudit: any[] = [];
+    const crisisTickets: any[] = [];
+
+    const podsData = workspaces.map((ws) => {
+      if (ws.isQuotaLocked) totalLockedPods++;
+      totalClaimedSeats += ws.members.length;
+
+      const leaderMember = ws.members.find((m) => m.role === 'LEADER');
+      const openTickets = ws.tickets.filter(
+        (t) => t.status !== 'RESOLVED' && t.status !== 'CLOSED',
+      );
+
+      // Collect crisis tickets
+      ws.tickets.forEach((t) => {
+        if (t.priority === 'CRITICAL' && t.status !== 'CLOSED') {
+          crisisTickets.push({
+            id: t.id,
+            ticketNumber: t.ticketNumber,
+            title: t.title,
+            priority: t.priority,
+            sentiment: t.sentiment,
+            podName: ws.name,
+            createdAt: t.createdAt,
+          });
+        }
+      });
+
+      // Collect tokens for audit
+      ws.inviteTokens.forEach((tok) => {
+        tokenAudit.push({
+          id: tok.id,
+          token: tok.token,
+          role: tok.role,
+          podName: ws.name,
+          workspaceId: ws.id,
+          isUsed: tok.isUsed,
+          usedBy: tok.usedBy,
+          usedAt: tok.usedAt,
+          createdAt: tok.createdAt,
+        });
+      });
+
+      return {
+        id: ws.id,
+        name: ws.name,
+        podCategory: ws.podCategory,
+        services: ws.services,
+        isQuotaLocked: ws.isQuotaLocked,
+        assignedQuota: ws.assignedQuota,
+        maxMembers: ws.maxMembers,
+        membersCount: ws.members.length,
+        leaderName: leaderMember?.user?.fullName || null,
+        leaderClaimed: !!leaderMember,
+        openTicketsCount: openTickets.length,
+      };
+    });
+
+    tokenAudit.sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    );
+
+    return {
+      organization: {
+        id: org.id,
+        name: org.name,
+        industry: org.industry,
+        totalSeats: org.totalSeats,
+        planTier: org.planTier,
+        leadershipMode: org.leadershipMode,
+      },
+      stats: {
+        totalSeats: org.totalSeats,
+        claimedSeats: totalClaimedSeats,
+        seatUtilizationPercentage: Math.min(
+          100,
+          Math.round((totalClaimedSeats / (org.totalSeats || 1)) * 100),
+        ),
+        totalPods: workspaces.length,
+        lockedPods: totalLockedPods,
+        crisisCount: crisisTickets.length,
+      },
+      workspaces: podsData,
+      tokenAudit,
+      crisisTickets,
+    };
+  }
+
+  /**
+   * Regenerate a Single-Use Token for a Pod Leader or Frontline Agent
+   * Invalidates old token and issues a fresh one
+   */
+  async regenerateToken(oldToken: string) {
+    if (!oldToken || oldToken.trim() === '') {
+      throw new BadRequestException('Token is required.');
+    }
+    const cleanToken = oldToken.trim();
+
+    const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
+      where: { token: cleanToken },
+      include: { workspace: true },
+    });
+
+    if (!tokenRecord) {
+      throw new NotFoundException('Token not found.');
+    }
+
+    // Invalidate old token
+    await this.prisma.workspaceInviteToken.update({
+      where: { id: tokenRecord.id },
+      data: {
+        isUsed: true,
+        usedBy: 'REVOKED_FOR_REGENERATION',
+        usedAt: new Date(),
+      },
+    });
+
+    // Generate new token string
+    const prefix = tokenRecord.role === 'LEADER' ? 'STX-LDR-' : 'STX-AGT-';
+    const newTokenStr =
+      prefix + crypto.randomBytes(3).toString('hex').toUpperCase();
+
+    await this.prisma.workspaceInviteToken.create({
+      data: {
+        workspaceId: tokenRecord.workspaceId,
+        token: newTokenStr,
+        role: tokenRecord.role,
+        isUsed: false,
+      },
+    });
+
+    // If it was a leader token, update workspace.inviteToken
+    if (tokenRecord.role === 'LEADER') {
+      await this.prisma.workspace.update({
+        where: { id: tokenRecord.workspaceId },
+        data: { inviteToken: newTokenStr },
+      });
+    }
+
+    this.logger.log(
+      `Regenerated ${tokenRecord.role} token for Pod "${tokenRecord.workspace.name}": ${cleanToken} -> ${newTokenStr}`,
+    );
+
+    return {
+      success: true,
+      oldToken: cleanToken,
+      newToken: newTokenStr,
+      role: tokenRecord.role,
+      workspaceId: tokenRecord.workspaceId,
+      workspaceName: tokenRecord.workspace.name,
+      joinUrl: `http://localhost:3000/join?token=${newTokenStr}`,
+    };
+  }
 }
