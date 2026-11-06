@@ -17,12 +17,19 @@ export interface WorkspaceMemberInfo {
   username: string;
   role: string;
   joinedAt: Date | string;
+  isOnline?: boolean;
+  presenceStatus?: 'ONLINE' | 'TERPUTUS' | 'OFFLINE';
+  token?: string | null;
+  tokenIsUsed?: boolean;
+  needsRegeneration?: boolean;
+  freshTokenReady?: boolean;
 }
 
 export interface WorkspaceDetailResponse {
   workspaceId: string;
   name: string;
   ownerName: string;
+  isLeader?: boolean;
   inviteToken: string;
   inviteUrl: string;
   isTokenUsed?: boolean;
@@ -69,6 +76,53 @@ export class WorkspaceService {
           { email: { equals: identifier, mode: 'insensitive' } },
         ],
       },
+      include: {
+        workspaceMembership: {
+          include: {
+            workspace: {
+              include: {
+                members: {
+                  include: {
+                    user: {
+                      include: {
+                        activitySessions: {
+                          orderBy: { loginAt: 'desc' },
+                          take: 1,
+                        },
+                      },
+                    },
+                  },
+                  orderBy: { joinedAt: 'asc' },
+                },
+                inviteTokens: {
+                  orderBy: { createdAt: 'desc' },
+                },
+              },
+            },
+          },
+        },
+        ownedWorkspaces: {
+          include: {
+            members: {
+              include: {
+                user: {
+                  include: {
+                    activitySessions: {
+                      orderBy: { loginAt: 'desc' },
+                      take: 1,
+                    },
+                  },
+                },
+              },
+              orderBy: { joinedAt: 'asc' },
+            },
+            inviteTokens: {
+              orderBy: { createdAt: 'desc' },
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+        },
+      },
     });
 
     if (!user) {
@@ -79,25 +133,12 @@ export class WorkspaceService {
       throw new ForbiddenException('Admin accounts are excluded from workspace team links.');
     }
 
-    // Check if user already has a workspace
-    let workspace = await this.prisma.workspace.findFirst({
-      where: { ownerId: user.id },
-      include: {
-        members: {
-          include: {
-            user: true,
-          },
-          orderBy: { joinedAt: 'asc' },
-        },
-        inviteTokens: {
-          orderBy: { createdAt: 'desc' },
-        },
-      },
-    });
+    // Check if user belongs to a Pod workspace first, then ownedWorkspaces
+    let workspace = user.workspaceMembership?.workspace || user.ownedWorkspaces?.[0];
 
-    // If not, create one
+    // If not, create one (independent user setup)
     if (!workspace) {
-      const initialToken = `inv_${crypto.randomBytes(8).toString('hex')}`;
+      const initialToken = `STX-AGT-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
       workspace = await this.prisma.workspace.create({
         data: {
           name: `${user.fullName || user.username}'s Support Team`,
@@ -108,12 +149,22 @@ export class WorkspaceService {
             create: {
               token: initialToken,
               isUsed: false,
+              role: 'AGENT',
             },
           },
         },
         include: {
           members: {
-            include: { user: true },
+            include: {
+              user: {
+                include: {
+                  activitySessions: {
+                    orderBy: { loginAt: 'desc' },
+                    take: 1,
+                  },
+                },
+              },
+            },
             orderBy: { joinedAt: 'asc' },
           },
           inviteTokens: {
@@ -124,15 +175,93 @@ export class WorkspaceService {
       this.logger.log(`Created new workspace for user @${user.username} with initial single-use token.`);
     }
 
-    // Ensure there is at least one active UNUSED token available
-    let activeToken = workspace.inviteTokens?.find((t) => !t.isUsed);
-    if (!activeToken) {
-      const newTokenStr = `inv_${crypto.randomBytes(8).toString('hex')}`;
+    const isLeader =
+      user.workspaceMembership?.role === 'LEADER' ||
+      (user.role as string) === 'LEADER' ||
+      workspace.ownerId === user.id;
+
+    const totalPodQuota = workspace.assignedQuota || workspace.maxMembers || 5;
+    // For Leader, Active Team Capacity reflects the member quota (excluding leader).
+    // E.g. Pod 1 has assignedQuota = 5 (1 Leader + 4 Members) -> capacity = 4 SEATS!
+    const effectiveMaxMembers = isLeader ? Math.max(1, totalPodQuota - 1) : totalPodQuota;
+
+    // Filter subordinate members (exclude the Leader themself)
+    const subordinateMembers = isLeader
+      ? (workspace.members || []).filter((m) => m.userId !== user.id && m.role !== 'LEADER')
+      : (workspace.members || []);
+
+    const now = Date.now();
+
+    // Map subordinate members with real-time presence and token regeneration data
+    const membersList: WorkspaceMemberInfo[] = subordinateMembers.map((m) => {
+      const latestSession = m.user?.activitySessions?.[0];
+      const isOnline = !!(
+        latestSession &&
+        latestSession.isOnline &&
+        now - new Date(latestSession.lastHeartbeatAt).getTime() < 90000
+      );
+
+      let presenceStatus: 'ONLINE' | 'TERPUTUS' | 'OFFLINE' = 'OFFLINE';
+      if (isOnline) {
+        presenceStatus = 'ONLINE';
+      } else {
+        const isCloseBrowserOrDisconnect =
+          latestSession?.logoutReason === 'BROWSER_CLOSED' ||
+          latestSession?.logoutReason === 'UNEXPECTED_DISCONNECT';
+        presenceStatus = isCloseBrowserOrDisconnect ? 'TERPUTUS' : 'OFFLINE';
+      }
+
+      // Correlate with token issued for this member
+      const memberNameLower = (m.user?.fullName || '').toLowerCase().trim();
+      const memberUsernameLower = (m.user?.username || '').toLowerCase().trim();
+
+      const memberTokenRecord = workspace.inviteTokens?.find((tok) => {
+        const usedByLower = (tok.usedBy || '').toLowerCase().trim();
+        return (
+          usedByLower &&
+          (usedByLower === memberNameLower ||
+            usedByLower === memberUsernameLower ||
+            (memberNameLower && usedByLower.includes(memberNameLower)))
+        );
+      });
+
+      const tokenString = memberTokenRecord?.token || null;
+      const tokenIsUsed = memberTokenRecord?.isUsed ?? false;
+      const needsRegeneration = !isOnline && (memberTokenRecord ? memberTokenRecord.isUsed : true);
+      const freshTokenReady = !isOnline && memberTokenRecord ? !memberTokenRecord.isUsed : false;
+
+      return {
+        id: m.id,
+        userId: m.userId,
+        fullName: m.user?.fullName || m.user?.username || 'Team Agent',
+        username: m.user?.username || '',
+        role: m.role || 'AGENT',
+        joinedAt: m.joinedAt,
+        isOnline,
+        presenceStatus,
+        token: tokenString,
+        tokenIsUsed,
+        needsRegeneration,
+        freshTokenReady,
+      };
+    });
+
+    const currentMembersCount = membersList.length;
+    const remainingSeats = Math.max(0, effectiveMaxMembers - currentMembersCount);
+
+    // Ensure there is an active UNUSED AGENT token ready to copy/share if seats remain
+    let activeToken = workspace.inviteTokens?.find(
+      (t) => (t.role === 'AGENT' || !t.role) && !t.isUsed && !t.usedBy,
+    );
+
+    if (!activeToken && remainingSeats > 0) {
+      const newTokenStr = `STX-AGT-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
       activeToken = await this.prisma.workspaceInviteToken.create({
         data: {
           workspaceId: workspace.id,
           token: newTokenStr,
           isUsed: false,
+          role: 'AGENT',
         },
       });
       await this.prisma.workspace.update({
@@ -141,14 +270,12 @@ export class WorkspaceService {
       });
     }
 
-    const membersList: WorkspaceMemberInfo[] = (workspace.members || []).map((m) => ({
-      id: m.id,
-      userId: m.userId,
-      fullName: m.user?.fullName || m.user?.username || 'Team Agent',
-      username: m.user?.username || '',
-      role: m.role || 'MEMBER',
-      joinedAt: m.joinedAt,
-    }));
+    // Fallback token if workspace is full
+    const displayToken =
+      activeToken?.token ||
+      workspace.inviteTokens?.find((t) => t.role === 'AGENT')?.token ||
+      workspace.inviteTokens?.[0]?.token ||
+      workspace.inviteToken;
 
     const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
 
@@ -156,12 +283,13 @@ export class WorkspaceService {
       workspaceId: workspace.id,
       name: workspace.name,
       ownerName: user.fullName || user.username || 'Workspace Owner',
-      inviteToken: activeToken.token,
-      inviteUrl: `${baseUrl}/join?token=${activeToken.token}`,
-      isTokenUsed: false,
-      maxMembers: workspace.maxMembers,
-      currentMembersCount: membersList.length,
-      remainingSeats: Math.max(0, workspace.maxMembers - membersList.length),
+      isLeader,
+      inviteToken: displayToken,
+      inviteUrl: `${baseUrl}/join?token=${displayToken}`,
+      isTokenUsed: activeToken ? activeToken.isUsed : false,
+      maxMembers: effectiveMaxMembers,
+      currentMembersCount,
+      remainingSeats,
       members: membersList,
     };
   }
@@ -177,30 +305,51 @@ export class WorkspaceService {
         OR: [
           { id: identifier },
           { username: { equals: identifier, mode: 'insensitive' } },
+          { email: { equals: identifier, mode: 'insensitive' } },
         ],
       },
       include: {
+        workspaceMembership: {
+          include: {
+            workspace: {
+              include: { members: true },
+            },
+          },
+        },
         ownedWorkspaces: {
           include: { members: true },
         },
       },
     });
 
-    const activeWorkspace = user?.ownedWorkspaces?.[0];
+    const activeWorkspace =
+      user?.workspaceMembership?.workspace || user?.ownedWorkspaces?.[0];
     if (!user || !activeWorkspace) {
       throw new NotFoundException('Workspace not found for this user.');
     }
 
-    if (activeWorkspace.members.length >= activeWorkspace.maxMembers) {
-      throw new BadRequestException('Workspace is full (8/8 members).');
+    const isLeader =
+      user.workspaceMembership?.role === 'LEADER' ||
+      (user.role as string) === 'LEADER' ||
+      activeWorkspace.ownerId === user.id;
+
+    const totalPodQuota = activeWorkspace.assignedQuota || activeWorkspace.maxMembers || 5;
+    const effectiveMaxMembers = isLeader ? Math.max(1, totalPodQuota - 1) : totalPodQuota;
+    const subordinateMembers = isLeader
+      ? activeWorkspace.members.filter((m) => m.userId !== user.id && m.role !== 'LEADER')
+      : activeWorkspace.members;
+
+    if (subordinateMembers.length >= effectiveMaxMembers) {
+      throw new BadRequestException(`Workspace is full (${effectiveMaxMembers}/${effectiveMaxMembers} members).`);
     }
 
-    const newTokenStr = `inv_${crypto.randomBytes(8).toString('hex')}`;
+    const newTokenStr = `STX-AGT-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
     const newToken = await this.prisma.workspaceInviteToken.create({
       data: {
         workspaceId: activeWorkspace.id,
         token: newTokenStr,
         isUsed: false,
+        role: 'AGENT',
       },
     });
 
@@ -456,6 +605,16 @@ export class WorkspaceService {
     if (!memberId) return { success: true };
 
     try {
+      // 1. Immediately log out user activity session as MANUAL_LOGOUT in DB
+      await this.prisma.userActivitySession.updateMany({
+        where: { userId: memberId, isOnline: true },
+        data: {
+          isOnline: false,
+          logoutAt: new Date(),
+          logoutReason: 'MANUAL_LOGOUT',
+        },
+      });
+
       const membership = await this.prisma.workspaceMember.findFirst({
         where: {
           userId: memberId,
@@ -474,18 +633,19 @@ export class WorkspaceService {
       const wsId = membership.workspaceId;
       const memberName = membership.user?.fullName || membership.user?.username || 'Team Member';
 
-      // Delete membership
-      await this.prisma.workspaceMember.delete({
-        where: { id: membership.id },
-      });
-
-      // Delete user
-      try {
-        await this.prisma.user.delete({
-          where: { id: memberId },
+      // Only delete membership for standalone demo workspaces without organization (preserve Multi-Pod team members)
+      if (!membership.workspace.organizationId) {
+        await this.prisma.workspaceMember.delete({
+          where: { id: membership.id },
         });
-      } catch (delErr) {
-        this.logger.warn(`Could not delete member user ${memberId}: ${(delErr as Error)?.message}`);
+
+        try {
+          await this.prisma.user.delete({
+            where: { id: memberId },
+          });
+        } catch (delErr) {
+          this.logger.warn(`Could not delete member user ${memberId}: ${(delErr as Error)?.message}`);
+        }
       }
 
       // Count remaining members
@@ -493,7 +653,7 @@ export class WorkspaceService {
         where: { workspaceId: wsId },
       });
 
-      this.logger.log(`Member "${memberName}" logged out. Remaining members: ${remainingCount}`);
+      this.logger.log(`Member "${memberName}" logged out (MANUAL_LOGOUT). Remaining members: ${remainingCount}`);
 
       // Broadcast WebSocket notification to owner dashboard
       this.eventsGateway.server?.emit('team:member_left', {
@@ -503,13 +663,9 @@ export class WorkspaceService {
         currentMembersCount: remainingCount,
       });
 
-      return {
-        success: true,
-        message: 'Member logged out successfully.',
-        currentMembersCount: remainingCount,
-      };
+      return { success: true, remainingMembersCount: remainingCount };
     } catch (err) {
-      this.logger.error(`Error during member logout: ${(err as Error)?.message}`);
+      this.logger.error(`Error in memberLogout: ${(err as Error)?.message}`);
       return { success: false, error: (err as Error)?.message };
     }
   }
@@ -544,6 +700,23 @@ export class WorkspaceService {
 
       if (!user || !user.ownedWorkspaces?.length) {
         return { success: true, message: 'No workspace found for user.' };
+      }
+
+      // Enterprise Multi-Pod Protection: Do NOT delete pods, members, or burn tokens on owner logout!
+      if (user.organizationId) {
+        await this.prisma.userActivitySession.updateMany({
+          where: { userId: user.id, isOnline: true },
+          data: {
+            isOnline: false,
+            logoutAt: new Date(),
+            logoutReason: 'MANUAL_LOGOUT',
+          },
+        });
+        this.logger.log(`Owner @${user.username} logged out from multi-pod organization. Structure and members preserved.`);
+        return {
+          success: true,
+          message: 'Multi-pod organization structure preserved on logout.',
+        };
       }
 
       for (const workspace of user.ownedWorkspaces) {
@@ -645,19 +818,26 @@ export class WorkspaceService {
         OR: [
           { id: ownerIdentifier },
           { username: { equals: ownerIdentifier, mode: 'insensitive' } },
+          { email: { equals: ownerIdentifier, mode: 'insensitive' } },
         ],
       },
-      include: { ownedWorkspaces: true },
+      include: {
+        workspaceMembership: {
+          include: { workspace: true },
+        },
+        ownedWorkspaces: true,
+      },
     });
 
-    if (!user || !user.ownedWorkspaces?.length) {
+    const workspace = user?.workspaceMembership?.workspace || user?.ownedWorkspaces?.[0];
+    if (!user || !workspace) {
       throw new NotFoundException('Workspace not found for this user.');
     }
 
     const member = await this.prisma.workspaceMember.findFirst({
       where: {
         id: memberId,
-        workspace: { ownerId: user.id },
+        workspaceId: workspace.id,
       },
       include: { workspace: true },
     });
@@ -953,10 +1133,16 @@ export class WorkspaceService {
 
     const pods = user.organization?.workspaces || user.ownedWorkspaces || [];
 
+    const displayIndustry =
+      user.organization?.industry === 'OTHER' && user.organization?.customIndustryDescription
+        ? user.organization.customIndustryDescription
+        : user.organization?.industry || 'OTHER';
+
     return {
       organizationName:
         user.organization?.name || `${user.fullName || user.username}'s Team`,
-      industry: user.organization?.industry || 'OTHER',
+      industry: displayIndustry,
+      customIndustryDescription: user.organization?.customIndustryDescription || null,
       totalSeats: user.organization?.totalSeats || 8,
       leadershipMode: user.organization?.leadershipMode || 'UNIFIED',
       pods: pods.map((p) => {
@@ -1307,10 +1493,22 @@ export class WorkspaceService {
           (_, i) => i + 1,
         );
 
+    const activeLeaderMember = currentWorkspace.members?.find(
+      (m: any) => m.role === 'LEADER',
+    );
+    const isExistingLeader = !!activeLeaderMember;
+    const existingLeaderName =
+      activeLeaderMember?.user?.fullName ||
+      activeLeaderMember?.user?.username ||
+      tokenRecord.usedBy ||
+      null;
+
     return {
       valid: true,
       token: tokenRecord.token,
       role: 'LEADER',
+      isExistingLeader,
+      existingLeaderName,
       workspace: {
         id: currentWorkspace.id,
         name: currentWorkspace.name,
@@ -1339,6 +1537,7 @@ export class WorkspaceService {
 
   /**
    * Lock Leader Quota (Click Checkmark [✓]) & Auto-Generate Single-Use Agent Tokens
+   * OR Re-login Existing Leader if Pod is already locked and active
    */
   async lockLeaderQuota(dto: {
     token: string;
@@ -1362,13 +1561,17 @@ export class WorkspaceService {
       );
     }
 
-    const maxAllowed = quotaStatus.quotaStats.maxSubordinatesAllowed;
-    // Auto-clamp chosen count to available capacity so leader activation never crashes
-    const safeCount = Math.min(Math.max(1, chosenCount), maxAllowed);
-
     const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
       where: { token: cleanToken },
-      include: { workspace: true },
+      include: {
+        workspace: {
+          include: {
+            members: {
+              include: { user: true },
+            },
+          },
+        },
+      },
     });
 
     if (!tokenRecord) {
@@ -1377,7 +1580,102 @@ export class WorkspaceService {
 
     const workspace = tokenRecord.workspace;
 
-    // 2. Create Leader User Account
+    // Check if Pod ALREADY has a registered Leader (e.g. Meta, Tita re-logging in via regenerated token)
+    const existingLeaderMember = workspace.members.find(
+      (m: any) => m.role === 'LEADER',
+    );
+
+    if (existingLeaderMember && existingLeaderMember.user) {
+      const leaderUser = existingLeaderMember.user;
+
+      if (password && password.trim() !== '') {
+        const passwordHash = crypto
+          .createHash('sha256')
+          .update(password.trim())
+          .digest('hex');
+        await this.prisma.user.update({
+          where: { id: leaderUser.id },
+          data: { passwordHash },
+        });
+      }
+
+      // Mark single-use token as consumed upon successful login
+      await this.prisma.workspaceInviteToken.update({
+        where: { id: tokenRecord.id },
+        data: {
+          isUsed: true,
+          usedBy: leaderUser.fullName || leaderUser.username,
+          usedAt: new Date(),
+        },
+      });
+
+      // Start presence activity session
+      try {
+        await this.prisma.userActivitySession.updateMany({
+          where: { userId: leaderUser.id, isOnline: true },
+          data: {
+            isOnline: false,
+            logoutAt: new Date(),
+            logoutReason: 'SESI_BARU_DIMULAI',
+          },
+        });
+
+        await this.prisma.userActivitySession.create({
+          data: {
+            userId: leaderUser.id,
+            organizationId: workspace.organizationId,
+            workspaceId: workspace.id,
+            role: 'LEADER',
+            loginAt: new Date(),
+            lastHeartbeatAt: new Date(),
+            isOnline: true,
+          },
+        });
+      } catch (err) {
+        this.logger.warn(`Could not start leader activity session: ${(err as Error)?.message}`);
+      }
+
+      // Fetch all agent tokens in this pod for the leader dashboard
+      const agentTokens = await this.prisma.workspaceInviteToken.findMany({
+        where: { workspaceId: workspace.id, role: 'AGENT' },
+        select: { token: true },
+      });
+
+      this.logger.log(
+        `Leader ${leaderUser.fullName} (@${leaderUser.username}) re-logged into Pod "${workspace.name}" via token ${cleanToken}.`,
+      );
+
+      return {
+        success: true,
+        isReLogin: true,
+        leader: {
+          id: leaderUser.id,
+          username: leaderUser.username,
+          fullName: leaderUser.fullName,
+          email: leaderUser.email,
+          role: 'LEADER',
+          workspaceRole: 'LEADER',
+          avatarText: (leaderUser.fullName || leaderUser.username || 'LD').slice(0, 2).toUpperCase(),
+          workspaceId: workspace.id,
+        },
+        workspace: {
+          id: workspace.id,
+          name: workspace.name,
+          assignedQuota: workspace.assignedQuota,
+          isQuotaLocked: true,
+        },
+        agentTokens: agentTokens.map((t) => ({
+          token: t.token,
+          joinUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/join?token=${t.token}`,
+        })),
+      };
+    }
+
+    const maxAllowed = quotaStatus.quotaStats.maxSubordinatesAllowed;
+    // Auto-clamp chosen count to available capacity so leader activation never crashes
+    const safeCount = Math.min(Math.max(1, chosenCount), maxAllowed);
+
+    // 2. Create Leader User Account (First time activation)
     const slug = cleanName
       .toLowerCase()
       .replace(/[^a-z0-9]/g, '')
@@ -1471,6 +1769,15 @@ export class WorkspaceService {
 
     // Start activity session for leader
     try {
+      await this.prisma.userActivitySession.updateMany({
+        where: { userId: leaderUser.id, isOnline: true },
+        data: {
+          isOnline: false,
+          logoutAt: new Date(),
+          logoutReason: 'SESI_BARU_DIMULAI',
+        },
+      });
+
       await this.prisma.userActivitySession.create({
         data: {
           userId: leaderUser.id,
@@ -1604,7 +1911,9 @@ export class WorkspaceService {
       };
     }
 
-    const leaderMember = tokenRecord.workspace?.members[0];
+    const leaderMember =
+      tokenRecord.workspace?.members?.find((m: any) => m.role === 'LEADER') ||
+      tokenRecord.workspace?.members[0];
 
     return {
       valid: true,
@@ -1620,7 +1929,9 @@ export class WorkspaceService {
         id: tokenRecord.workspace?.organization?.id,
         name: tokenRecord.workspace?.organization?.name,
       },
-      leaderName: leaderMember?.user?.fullName || 'Pod Leader',
+      leaderName: leaderMember?.user?.fullName || leaderMember?.user?.username || 'Pod Leader',
+      assignedMemberName: tokenRecord.usedBy || null,
+      isReLogin: !!tokenRecord.usedBy,
     };
   }
 
@@ -1648,7 +1959,11 @@ export class WorkspaceService {
       where: { token: cleanToken },
       include: {
         workspace: {
-          include: { members: true },
+          include: {
+            members: {
+              include: { user: true },
+            },
+          },
         },
       },
     });
@@ -1659,44 +1974,75 @@ export class WorkspaceService {
 
     const workspace = tokenRecord.workspace;
 
-    if (workspace.members.length >= workspace.maxMembers) {
-      throw new BadRequestException(
-        `Pod capacity is already filled (${workspace.members.length}/${workspace.maxMembers} seats).`,
+    // Check if an existing member with the exact same name or username already belongs to this workspace, or matches assigned token owner
+    const allocatedName = (tokenRecord.usedBy || '').trim().toLowerCase();
+    const existingMember = workspace.members.find(
+      (m: any) =>
+        m.user?.fullName?.trim().toLowerCase() === cleanName.toLowerCase() ||
+        m.user?.username?.trim().toLowerCase() === cleanName.toLowerCase() ||
+        (allocatedName && m.user?.fullName?.trim().toLowerCase() === allocatedName) ||
+        (allocatedName && m.user?.username?.trim().toLowerCase() === allocatedName),
+    );
+
+    let agentUser: any = null;
+
+    if (existingMember && existingMember.user) {
+      // Re-login / restore access for existing member (e.g. Budi, Tini reclaiming access via regenerated token)
+      agentUser = existingMember.user;
+      if (password && password.trim() !== '') {
+        const passwordHash = crypto
+          .createHash('sha256')
+          .update(password.trim())
+          .digest('hex');
+        await this.prisma.user.update({
+          where: { id: agentUser.id },
+          data: { passwordHash },
+        });
+      }
+      this.logger.log(
+        `Existing member "${cleanName}" (@${agentUser.username}) reclaimed token into Pod "${workspace.name}".`,
       );
+    } else {
+      // New member joining: check capacity strictly
+      if (workspace.members.length >= workspace.maxMembers) {
+        throw new BadRequestException(
+          `Pod capacity is already filled (${workspace.members.length}/${workspace.maxMembers} seats).`,
+        );
+      }
+
+      // Create Agent user
+      const slug = cleanName
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '')
+        .slice(0, 10);
+      const username = `${slug || 'agent'}_${Math.floor(1000 + Math.random() * 9000)}`;
+      const email = `${username}@agent.${workspace.id.slice(0, 8)}.sentrix.local`;
+      const passwordHash =
+        password && password.trim() !== ''
+          ? crypto.createHash('sha256').update(password.trim()).digest('hex')
+          : crypto.createHash('sha256').update('0o0o 0o0o').digest('hex');
+
+      agentUser = await this.prisma.user.create({
+        data: {
+          username,
+          fullName: cleanName,
+          email,
+          passwordHash,
+          role: 'AGENT',
+          organizationId: workspace.organizationId,
+          onboardingCompleted: true,
+        },
+      });
+
+      // Add to WorkspaceMember
+      await this.prisma.workspaceMember.create({
+        data: {
+          workspaceId: workspace.id,
+          userId: agentUser.id,
+          role: 'AGENT',
+        },
+      });
     }
-
-    // Create Agent user
-    const slug = cleanName
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, '')
-      .slice(0, 10);
-    const username = `${slug || 'agent'}_${Math.floor(1000 + Math.random() * 9000)}`;
-    const email = `${username}@agent.${workspace.id.slice(0, 8)}.sentrix.local`;
-    const passwordHash =
-      password && password.trim() !== ''
-        ? crypto.createHash('sha256').update(password.trim()).digest('hex')
-        : crypto.createHash('sha256').update('0o0o 0o0o').digest('hex');
-
-    const agentUser = await this.prisma.user.create({
-      data: {
-        username,
-        fullName: cleanName,
-        email,
-        passwordHash,
-        role: 'AGENT',
-        organizationId: workspace.organizationId,
-        onboardingCompleted: true,
-      },
-    });
-
-    // Add to WorkspaceMember
-    await this.prisma.workspaceMember.create({
-      data: {
-        workspaceId: workspace.id,
-        userId: agentUser.id,
-        role: 'AGENT',
-      },
-    });
 
     // Mark single-use token as consumed
     await this.prisma.workspaceInviteToken.update({
@@ -1704,12 +2050,21 @@ export class WorkspaceService {
       data: {
         isUsed: true,
         usedBy: cleanName,
-        usedAt: new Date(),
+        usedAt: existingMember ? (existingMember.joinedAt || new Date()) : new Date(),
       },
     });
 
     // Start activity session for agent
     try {
+      await this.prisma.userActivitySession.updateMany({
+        where: { userId: agentUser.id, isOnline: true },
+        data: {
+          isOnline: false,
+          logoutAt: new Date(),
+          logoutReason: 'SESI_BARU_DIMULAI',
+        },
+      });
+
       await this.prisma.userActivitySession.create({
         data: {
           userId: agentUser.id,
@@ -1772,7 +2127,13 @@ export class WorkspaceService {
             workspaces: {
               include: {
                 members: { include: { user: true } },
-                tickets: true,
+                tickets: {
+                  include: {
+                    messages: {
+                      orderBy: { createdAt: 'asc' },
+                    },
+                  },
+                },
                 inviteTokens: { orderBy: { createdAt: 'desc' } },
               },
               orderBy: { createdAt: 'asc' },
@@ -1788,12 +2149,18 @@ export class WorkspaceService {
 
     const org = user.organization;
     const workspaces = org.workspaces || [];
+    const now = Date.now();
 
     // Calculate metrics
     let totalClaimedSeats = 0;
     let totalLockedPods = 0;
     const tokenAudit: any[] = [];
     const crisisTickets: any[] = [];
+    const slaBreachedTickets: any[] = [];
+    const TARGET_SLA_MS = 15 * 60 * 1000; // Ambang batas target respon SLA (15 Menit)
+    let totalEvaluatedTickets = 0;
+    let slaMetCount = 0;
+    let slaBreachedCount = 0;
 
     const podsData = workspaces.map((ws) => {
       if (ws.isQuotaLocked) totalLockedPods++;
@@ -1804,8 +2171,53 @@ export class WorkspaceService {
         (t) => t.status !== 'RESOLVED' && t.status !== 'CLOSED',
       );
 
-      // Collect crisis tickets
-      ws.tickets.forEach((t) => {
+      // Collect crisis & evaluate dynamic SLA compliance for all tickets in this workspace
+      ws.tickets.forEach((t: any) => {
+        totalEvaluatedTickets++;
+
+        // Determine First Response Time (FRT) & SLA compliance
+        const firstAgentMsg = t.messages?.find(
+          (m: any) => m.senderId !== t.customerId && m.type !== 'INTERNAL_NOTE',
+        );
+
+        let isSlaMet = false;
+        let responseTimeMinutes = 0;
+
+        if (firstAgentMsg) {
+          const responseDurationMs =
+            new Date(firstAgentMsg.createdAt).getTime() -
+            new Date(t.createdAt).getTime();
+          responseTimeMinutes = Math.floor(responseDurationMs / (1000 * 60));
+          isSlaMet = responseDurationMs <= TARGET_SLA_MS;
+        } else if (t.status === 'RESOLVED' || t.status === 'CLOSED') {
+          const resolveDurationMs =
+            new Date(t.updatedAt).getTime() - new Date(t.createdAt).getTime();
+          responseTimeMinutes = Math.floor(resolveDurationMs / (1000 * 60));
+          isSlaMet = resolveDurationMs <= TARGET_SLA_MS;
+        } else {
+          // Open or new ticket waiting for agent reply
+          const elapsedMs = now - new Date(t.createdAt).getTime();
+          responseTimeMinutes = Math.floor(elapsedMs / (1000 * 60));
+          isSlaMet = elapsedMs <= TARGET_SLA_MS;
+        }
+
+        if (isSlaMet) {
+          slaMetCount++;
+        } else {
+          slaBreachedCount++;
+          slaBreachedTickets.push({
+            id: t.id,
+            ticketNumber: t.ticketNumber,
+            title: t.title,
+            priority: t.priority,
+            sentiment: t.sentiment,
+            podName: ws.name,
+            createdAt: t.createdAt,
+            elapsedMinutes: responseTimeMinutes,
+          });
+        }
+
+        // Collect crisis tickets
         if (t.priority === 'CRITICAL' && t.status !== 'CLOSED') {
           crisisTickets.push({
             id: t.id,
@@ -1871,11 +2283,21 @@ export class WorkspaceService {
           orderBy: { loginAt: 'desc' },
           take: 30,
         },
+        assignedTickets: {
+          where: {
+            status: { notIn: ['RESOLVED', 'CLOSED'] },
+          },
+          select: {
+            id: true,
+            ticketNumber: true,
+            title: true,
+            priority: true,
+          },
+        },
       },
       orderBy: { createdAt: 'asc' },
     });
 
-    const now = Date.now();
     const presenceList = allOrgUsers.map((u) => {
       const isSuperAdmin = u.role === 'ADMIN' || u.id === user.id;
       const isLeader = u.workspaceMembership?.role === 'LEADER';
@@ -1884,12 +2306,16 @@ export class WorkspaceService {
         u.workspaceMembership?.workspace?.name ||
         (isSuperAdmin ? 'Executive Cockpit' : 'Belum Ditugaskan');
 
+      const activeTicketsCount = (u as any).assignedTickets
+        ? (u as any).assignedTickets.length
+        : 0;
+
       const latestSession = u.activitySessions[0] || null;
-      // Active session: isOnline = true and heartbeat within last 45 seconds
+      // Active session: isOnline = true and heartbeat within last 90 seconds (allows background tab switching)
       const isActuallyOnline = !!(
         latestSession &&
         latestSession.isOnline &&
-        now - new Date(latestSession.lastHeartbeatAt).getTime() < 45000
+        now - new Date(latestSession.lastHeartbeatAt).getTime() < 90000
       );
 
       // Current online duration in seconds
@@ -1899,6 +2325,48 @@ export class WorkspaceService {
           0,
           Math.floor((now - new Date(latestSession.loginAt).getTime()) / 1000),
         );
+      }
+
+      // Operational Readiness & Workload State (Opsi 1)
+      let operationalState = 'STANDBY';
+      let operationalStateLabel = 'Siaga (Standby)';
+      let workloadDescription = 'Siap Menerima Tiket';
+
+      if (isSuperAdmin) {
+        operationalState = 'EXECUTIVE_SUPERVISION';
+        operationalStateLabel = 'Pengawasan Eksekutif';
+        workloadDescription = 'Pusat Kendali Organisasi';
+      } else if (isActuallyOnline) {
+        if (activeTicketsCount > 0) {
+          operationalState = 'SERVING';
+          operationalStateLabel = 'Melayani Pelanggan';
+          workloadDescription = `${activeTicketsCount} Tiket Aktif Ditangani`;
+        } else {
+          operationalState = 'STANDBY';
+          operationalStateLabel = 'Siaga (Standby)';
+          workloadDescription = 'Siap Menerima Tiket';
+        }
+      } else {
+        const isCloseBrowserOrDisconnect =
+          latestSession?.logoutReason === 'BROWSER_CLOSED' ||
+          latestSession?.logoutReason === 'UNEXPECTED_DISCONNECT' ||
+          !latestSession?.logoutReason;
+
+        if (isCloseBrowserOrDisconnect) {
+          operationalState = 'ABRUPT_DISCONNECT';
+          operationalStateLabel = 'Terputus (Close Browser)';
+          workloadDescription =
+            activeTicketsCount > 0
+              ? `Perhatian: ${activeTicketsCount} Tiket Ditinggalkan!`
+              : 'Tidak Ada Tiket Tergantung';
+        } else {
+          operationalState = 'OFF_DUTY';
+          operationalStateLabel = 'Off-Duty (Selesai Shift)';
+          workloadDescription =
+            activeTicketsCount > 0
+              ? `${activeTicketsCount} Tiket Tertunda`
+              : 'Meja Kerja Bebas';
+        }
       }
 
       // Check if there was an unexpected disconnect
@@ -1970,13 +2438,21 @@ export class WorkspaceService {
         username: u.username,
         role: userRole,
         podName,
+        workspaceId: u.workspaceMembership?.workspaceId || null,
+        joinedAt: u.workspaceMembership?.joinedAt || u.createdAt,
         isOnline: isActuallyOnline,
         status: isActuallyOnline
           ? 'ONLINE'
-          : latestSession?.logoutReason === 'UNEXPECTED_DISCONNECT'
-            ? 'TERPUTUS'
-            : 'OFFLINE',
+          : latestSession?.logoutReason === 'MANUAL_LOGOUT'
+            ? 'LOGOUT'
+            : latestSession?.logoutReason === 'BROWSER_CLOSED'
+              ? 'LOGOUT_CLOSE_BROWSER'
+              : 'LOGOUT_CLOSE_BROWSER',
         currentOnlineSeconds,
+        activeTicketsCount,
+        operationalState,
+        operationalStateLabel,
+        workloadDescription,
         latestLoginAt: latestSession?.loginAt || null,
         latestLogoutAt: latestSession?.logoutAt || null,
         hadUnexpectedDisconnect,
@@ -1989,22 +2465,74 @@ export class WorkspaceService {
 
     // Enrich tokenAudit with real-time user online/logout status for the "DIKELOLA" column
     const enrichedTokenAudit = tokenAudit.map((tok) => {
-      if (!tok.isUsed || !tok.usedBy) {
+      // Find workspace for this token to check if Pod already has a registered Leader
+      const parentWorkspace = workspaces.find((w) => w.id === tok.workspaceId);
+      const activeLeader = parentWorkspace?.members?.find((m: any) => m.role === 'LEADER');
+      const activeLeaderName = activeLeader?.user?.fullName || activeLeader?.user?.username;
+
+      // If this is a LEADER token and the pod already has an active leader, guarantee it is marked active!
+      const isLeaderOfActivePod = tok.role === 'LEADER' && !!activeLeaderName;
+      // If this is an AGENT token with an allocated member name, guarantee it is marked active!
+      const isClaimedAgent = tok.role === 'AGENT' && !!tok.usedBy;
+      const effectiveUsed = tok.isUsed || isLeaderOfActivePod || isClaimedAgent;
+      const effectiveUsedBy = tok.usedBy || (isLeaderOfActivePod ? activeLeaderName : null);
+
+      if (!effectiveUsed || !effectiveUsedBy) {
         return {
           ...tok,
+          isUsed: false,
+          rawIsUsed: false,
+          needsRegeneration: false,
+          usedBy: null,
           isUserOnline: false,
           userStatus: 'UNCLAIMED',
+          hadManualLogout: false,
         };
       }
+
       const matched = presenceList.find(
         (p) =>
-          p.fullName?.toLowerCase() === tok.usedBy.toLowerCase() ||
-          p.username?.toLowerCase() === tok.usedBy.toLowerCase(),
+          p.fullName?.toLowerCase() === effectiveUsedBy.toLowerCase() ||
+          p.username?.toLowerCase() === effectiveUsedBy.toLowerCase(),
       );
+
+      const hadManual =
+        !matched?.isOnline &&
+        (matched?.status === 'LOGOUT' ||
+          matched?.sessionHistory?.[0]?.logoutReason === 'MANUAL_LOGOUT');
+
+      const hadCloseBrowser =
+        !matched?.isOnline && !hadManual;
+
+      // Look up workspace member record to get authoritative joinedAt if available
+      const memberRecord = parentWorkspace?.members?.find(
+        (m: any) =>
+          m.user?.fullName?.trim().toLowerCase() === effectiveUsedBy?.trim().toLowerCase() ||
+          m.user?.username?.trim().toLowerCase() === effectiveUsedBy?.trim().toLowerCase(),
+      );
+      const effectiveUsedAt = memberRecord?.joinedAt || tok.usedAt;
+
+      const isLoggedOut = !matched?.isOnline;
+      const isTokenPhysicallyUsed = tok.isUsed;
+      const needsRegeneration = isLoggedOut && isTokenPhysicallyUsed;
+
       return {
         ...tok,
+        isUsed: true,
+        rawIsUsed: tok.isUsed,
+        needsRegeneration,
+        usedBy: effectiveUsedBy,
+        usedAt: effectiveUsedAt,
         isUserOnline: matched ? matched.isOnline : false,
-        userStatus: matched ? (matched.isOnline ? 'ONLINE' : 'LOGOUT') : 'LOGOUT',
+        userStatus: matched
+          ? matched.isOnline
+            ? 'ONLINE'
+            : hadManual
+              ? 'LOGOUT'
+              : 'LOGOUT_CLOSE_BROWSER'
+          : 'LOGOUT_CLOSE_BROWSER',
+        hadManualLogout: hadManual,
+        hadCloseBrowser: hadCloseBrowser,
       };
     });
 
@@ -2024,30 +2552,69 @@ export class WorkspaceService {
       .filter((item): item is NonNullable<typeof item> => item !== null)
       .sort((a, b) => new Date(b.joinedAt).getTime() - new Date(a.joinedAt).getTime());
 
+    // Calculate total effective capacity: if all active pods are locked, derive authoritative capacity from sum of assignedQuota
+    const lockedPodsSum = workspaces
+      .filter((w) => w.isQuotaLocked)
+      .reduce((sum, w) => sum + (w.assignedQuota || w.maxMembers || 0), 0);
+    const effectiveTotalSeats =
+      lockedPodsSum > 0 && totalLockedPods === workspaces.length
+        ? lockedPodsSum
+        : org.totalSeats || 9;
+
+    // Self-healing: if org.totalSeats in database has drifted from the actual locked pod quotas, sync it back
+    if (org.totalSeats !== effectiveTotalSeats) {
+      this.prisma.organization
+        .update({
+          where: { id: org.id },
+          data: { totalSeats: effectiveTotalSeats },
+        })
+        .catch((e) =>
+          this.logger.warn(`Could not sync organization totalSeats: ${e?.message}`),
+        );
+    }
+
+    const slaCompliancePercentage =
+      totalEvaluatedTickets > 0
+        ? Math.round((slaMetCount / totalEvaluatedTickets) * 1000) / 10
+        : 100;
+
+    const slaStatusLabel =
+      slaCompliancePercentage >= 95
+        ? 'Optimal'
+        : slaCompliancePercentage >= 80
+          ? 'Perhatian'
+          : 'Kritis';
+
     return {
       organization: {
         id: org.id,
         name: org.name,
         industry: org.industry,
-        totalSeats: org.totalSeats,
+        totalSeats: effectiveTotalSeats,
         planTier: org.planTier,
         leadershipMode: org.leadershipMode,
       },
       stats: {
-        totalSeats: org.totalSeats,
+        totalSeats: effectiveTotalSeats,
         claimedSeats: totalClaimedSeats,
         seatUtilizationPercentage: Math.min(
           100,
-          Math.round((totalClaimedSeats / (org.totalSeats || 1)) * 100),
+          Math.round((totalClaimedSeats / (effectiveTotalSeats || 1)) * 100),
         ),
         totalPods: workspaces.length,
         lockedPods: totalLockedPods,
         crisisCount: crisisTickets.length,
-        onlineCount: presenceList.filter((p) => p.isOnline).length,
+        onlineCount: presenceList.filter((p) => p.role !== 'SUPER_ADMIN' && p.isOnline).length,
+        slaCompliancePercentage,
+        slaStatusLabel,
+        slaMetCount,
+        slaBreachedCount,
+        totalEvaluatedTickets,
       },
       workspaces: podsData,
       tokenAudit: enrichedTokenAudit,
       crisisTickets,
+      slaBreachedTickets,
       presenceMonitoring: presenceList,
       recentLeaderActivations,
     };
@@ -2077,13 +2644,57 @@ export class WorkspaceService {
     const newTokenStr =
       prefix + crypto.randomBytes(3).toString('hex').toUpperCase();
 
+    let isAlreadyClaimed = false;
+    let retainedUsedBy: string | null = null;
+    let retainedUsedAt: Date | null = null;
+
+    if (tokenRecord.role === 'LEADER') {
+      const activeLeaderMember = await this.prisma.workspaceMember.findFirst({
+        where: { workspaceId: tokenRecord.workspaceId, role: 'LEADER' },
+        include: { user: true },
+      });
+      isAlreadyClaimed = !!activeLeaderMember || tokenRecord.isUsed;
+      retainedUsedBy =
+        activeLeaderMember?.user?.fullName ||
+        activeLeaderMember?.user?.username ||
+        tokenRecord.usedBy;
+      retainedUsedAt = tokenRecord.usedAt || activeLeaderMember?.joinedAt || new Date();
+    } else {
+      // For AGENT member:
+      // If token was already used or had an assigned user, preserve their activated status and name
+      const previousName = (tokenRecord.usedBy || '').trim();
+      if (previousName || tokenRecord.isUsed) {
+        const activeMember = await this.prisma.workspaceMember.findFirst({
+          where: {
+            workspaceId: tokenRecord.workspaceId,
+            role: 'AGENT',
+            OR: [
+              { user: { fullName: { equals: previousName, mode: 'insensitive' } } },
+              { user: { username: { equals: previousName, mode: 'insensitive' } } },
+            ],
+          },
+          include: { user: true },
+        });
+
+        if (activeMember && activeMember.user) {
+          isAlreadyClaimed = true;
+          retainedUsedBy = activeMember.user.fullName || activeMember.user.username;
+          retainedUsedAt = activeMember.joinedAt || tokenRecord.usedAt || new Date();
+        } else if (previousName) {
+          isAlreadyClaimed = true;
+          retainedUsedBy = previousName;
+          retainedUsedAt = tokenRecord.usedAt || new Date();
+        }
+      }
+    }
+
     // Update the existing token in-place to avoid bloated duplicate rows
     await this.prisma.workspaceInviteToken.update({
       where: { id: tokenRecord.id },
       data: {
         token: newTokenStr,
         isUsed: false,
-        usedBy: null,
+        usedBy: retainedUsedBy,
         usedAt: null,
       },
     });

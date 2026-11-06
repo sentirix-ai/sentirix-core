@@ -269,10 +269,20 @@ export class WorkspaceController {
    * Regenerate Single-Use Token for Leader or Agent
    */
   @Post('regenerate-token')
-  async regenerateToken(@Body('token') token: string) {
-    if (!token) {
-      throw new BadRequestException('Token string is required.');
+  async regenerateToken(@Body() body: { token?: string; identifier?: string }) {
+    if (body?.token && body.token.trim() !== '') {
+      return this.workspaceService.regenerateToken(body.token);
     }
-    return this.workspaceService.regenerateToken(token);
+    if (body?.identifier && body.identifier.trim() !== '') {
+      const ws = await this.workspaceService.getOrCreateUserWorkspace(body.identifier);
+      return {
+        success: true,
+        newToken: ws.inviteToken,
+        joinUrl: ws.inviteUrl,
+        workspace: ws,
+      };
+    }
+    throw new BadRequestException('Either token or identifier is required.');
   }
 }
+

@@ -14,9 +14,14 @@ import { UpdateAvatarDto } from './dto/update-avatar.dto.js';
 export interface AuthUserResponse {
   id: string;
   username: string;
+  fullName?: string;
   email: string;
   phone?: string;
-  role: 'ADMIN' | 'USER';
+  role: 'ADMIN' | 'USER' | 'LEADER';
+  workspaceRole?: string;
+  workspaceId?: string;
+  workspaceName?: string;
+  isGuestMember?: boolean;
   verificationMethod?: 'EMAIL' | 'PHONE';
   isVerified: boolean;
   avatarText: string;
@@ -103,18 +108,16 @@ export class AuthService implements OnModuleInit {
       });
       if (!user) return null;
 
-      // Close previous unclosed sessions as UNEXPECTED_DISCONNECT if lastHeartbeatAt older than 45s
-      const cutoff = new Date(Date.now() - 45000);
+      // Close all previous active sessions for this user so they don't produce duplicate ghost online sessions
       await this.prisma.userActivitySession.updateMany({
         where: {
           userId,
           isOnline: true,
-          lastHeartbeatAt: { lt: cutoff },
         },
         data: {
           isOnline: false,
           logoutAt: new Date(),
-          logoutReason: 'UNEXPECTED_DISCONNECT',
+          logoutReason: 'SESI_BARU_DIMULAI',
         },
       });
 
@@ -351,6 +354,11 @@ export class AuthService implements OnModuleInit {
             { fullName: { equals: cleanId, mode: 'insensitive' } },
           ],
         },
+        include: {
+          workspaceMembership: {
+            include: { workspace: true },
+          },
+        },
       });
 
       if (dbUser) {
@@ -358,12 +366,20 @@ export class AuthService implements OnModuleInit {
           throw new UnauthorizedException('Incorrect password. Please verify and try again.');
         }
 
+        const wsRole = dbUser.workspaceMembership?.role;
+        const isLeader = wsRole === 'LEADER';
+
         return {
           id: dbUser.id,
           username: dbUser.username || dbUser.fullName,
+          fullName: (dbUser.fullName || dbUser.username) ?? undefined,
           email: dbUser.email,
           phone: dbUser.phone || undefined,
-          role: dbUser.role === 'ADMIN' ? 'ADMIN' : 'USER',
+          role: dbUser.role === 'ADMIN' ? 'ADMIN' : (isLeader ? 'LEADER' : 'USER'),
+          workspaceRole: wsRole || undefined,
+          workspaceId: dbUser.workspaceMembership?.workspaceId || undefined,
+          workspaceName: dbUser.workspaceMembership?.workspace?.name || undefined,
+          isGuestMember: wsRole === 'AGENT',
           verificationMethod: (dbUser.verificationMethod as 'EMAIL' | 'PHONE') || 'EMAIL',
           isVerified: true,
           avatarText: (dbUser.username || dbUser.fullName).slice(0, 2).toUpperCase(),

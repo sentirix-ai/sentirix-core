@@ -136,7 +136,9 @@ Return strictly JSON format:
       category: string;
       description: string;
       recommendedSeats: number;
+      service?: string;
     }>;
+    defaultServices?: string[];
   }> {
     const cleanIndustry = (industry || 'OTHER').trim();
     const cleanDesc = (customDescription || '').trim();
@@ -146,7 +148,7 @@ Return strictly JSON format:
         const prompt = `You are a world-class enterprise operations architect for Sentirix.
 The user is setting up a customer support organization.
 Industry/Sector: "${cleanIndustry}"
-${cleanDesc ? `Additional Specifics: "${cleanDesc}"` : ''}
+${cleanDesc ? `Additional Specifics / Business Model: "${cleanDesc}"` : ''}
 
 Generate exactly 6 specialized operational support pods (sub-teams) best suited for this exact business model using US industry standards.
 Rules:
@@ -154,6 +156,7 @@ Rules:
 2. Pod names must be concise, professional, and directly address customer complaint drivers for this vertical.
 3. Each pod must include a 1-sentence semantic description explaining what customer ticket topics it handles (crucial for AI routing).
 4. Assign recommendedSeats between 1 and 4 for each pod.
+5. Provide a primary specialized "service" name for each pod that represents its core service domain (e.g., "Flight Telemetry Diagnostics", "Acreage Mapping Analytics", "VIP Account Concierge").
 
 Return strictly JSON format:
 {
@@ -162,7 +165,8 @@ Return strictly JSON format:
       "name": "string",
       "category": "UPPERCASE_SNAKE_CASE",
       "description": "string",
-      "recommendedSeats": number
+      "recommendedSeats": number,
+      "service": "string"
     }
   ]
 }`;
@@ -177,14 +181,17 @@ Return strictly JSON format:
 
         const parsed = JSON.parse(response.text?.trim() || '{}');
         if (Array.isArray(parsed.pods) && parsed.pods.length >= 2) {
+          const mappedPods = parsed.pods.map((p: any) => ({
+            name: String(p.name || 'Support Pod'),
+            category: String(p.category || 'GENERAL').toUpperCase(),
+            description: String(p.description || 'Handles customer requests'),
+            recommendedSeats: Math.max(1, Math.min(8, Number(p.recommendedSeats) || 2)),
+            service: String(p.service || p.name?.replace(/\s+Pod$/i, '') || 'Customer Service').trim(),
+          }));
           return {
             industry: cleanIndustry,
-            pods: parsed.pods.map((p: any) => ({
-              name: String(p.name || 'Support Pod'),
-              category: String(p.category || 'GENERAL').toUpperCase(),
-              description: String(p.description || 'Handles customer requests'),
-              recommendedSeats: Math.max(1, Math.min(8, Number(p.recommendedSeats) || 2)),
-            })),
+            pods: mappedPods,
+            defaultServices: mappedPods.map((p: { service: string }) => p.service),
           };
         }
       } catch (err) {
@@ -192,7 +199,13 @@ Return strictly JSON format:
       }
     }
 
-    return this.getFallbackPodsForIndustry(cleanIndustry, cleanDesc);
+    const fallback = this.getFallbackPodsForIndustry(cleanIndustry, cleanDesc);
+    return {
+      ...fallback,
+      defaultServices:
+        fallback.defaultServices ||
+        fallback.pods.map((p: any) => p.service || p.name.replace(/\s+Pod$/i, '').trim()),
+    };
   }
 
   /**
@@ -414,7 +427,9 @@ Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
       category: string;
       description: string;
       recommendedSeats: number;
+      service?: string;
     }>;
+    defaultServices?: string[];
   } {
     const key = (industry || 'OTHER').toUpperCase().trim();
 
@@ -986,46 +1001,55 @@ Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
     const customLabel = customDescription
       ? ` (${customDescription.slice(0, 15)})`
       : '';
+    const otherPods = [
+      {
+        name: `Frontline Customer Operations Pod${customLabel}`,
+        category: 'OPERATIONS',
+        description: 'Frontline customer orders, general inquiries, immediate ticket intake',
+        recommendedSeats: 3,
+        service: customDescription ? `${customDescription.slice(0, 24)} Operations` : 'Frontline Operations & Ticket Triage',
+      },
+      {
+        name: 'Billing, Invoicing & Payment Verification Pod',
+        category: 'BILLING',
+        description: 'Payment verification, invoice receipts, bank wire reconciliation, refunds',
+        recommendedSeats: 2,
+        service: 'Billing, Invoicing & Payment Verification',
+      },
+      {
+        name: 'Product Quality & Replacement Warranty Pod',
+        category: 'QUALITY',
+        description: 'Product defects, replacement unit dispatches, warranty service requests',
+        recommendedSeats: 2,
+        service: 'Product Quality & Replacement Warranty',
+      },
+      {
+        name: 'Technical & Application Support Pod',
+        category: 'TECH_SUPPORT',
+        description: 'Software login issues, hardware diagnostics, account settings troubleshooting',
+        recommendedSeats: 2,
+        service: 'Technical & Application Support',
+      },
+      {
+        name: 'Account Security & Profile Management Pod',
+        category: 'SECURITY',
+        description: 'Password resets, 2FA authorization, profile data updates, access permissions',
+        recommendedSeats: 1,
+        service: 'Account Security & Profile Management',
+      },
+      {
+        name: 'Executive & High-Priority SLA Escalations Pod',
+        category: 'VIP_SLA',
+        description: 'Director-level escalations, breached contractual SLAs, strategic VIP accounts',
+        recommendedSeats: 1,
+        service: 'Executive & High-Priority SLA Escalations',
+      },
+    ];
+
     return {
       industry: 'OTHER',
-      pods: [
-        {
-          name: `Frontline Customer Operations Pod${customLabel}`,
-          category: 'OPERATIONS',
-          description: 'Frontline customer orders, general inquiries, immediate ticket intake',
-          recommendedSeats: 3,
-        },
-        {
-          name: 'Billing, Invoicing & Payment Verification Pod',
-          category: 'BILLING',
-          description: 'Payment verification, invoice receipts, bank wire reconciliation, refunds',
-          recommendedSeats: 2,
-        },
-        {
-          name: 'Product Quality & Replacement Warranty Pod',
-          category: 'QUALITY',
-          description: 'Product defects, replacement unit dispatches, warranty service requests',
-          recommendedSeats: 2,
-        },
-        {
-          name: 'Technical & Application Support Pod',
-          category: 'TECH_SUPPORT',
-          description: 'Software login issues, hardware diagnostics, account settings troubleshooting',
-          recommendedSeats: 2,
-        },
-        {
-          name: 'Account Security & Profile Management Pod',
-          category: 'SECURITY',
-          description: 'Password resets, 2FA authorization, profile data updates, access permissions',
-          recommendedSeats: 1,
-        },
-        {
-          name: 'Executive & High-Priority SLA Escalations Pod',
-          category: 'VIP_SLA',
-          description: 'Director-level escalations, breached contractual SLAs, strategic VIP accounts',
-          recommendedSeats: 1,
-        },
-      ],
+      pods: otherPods,
+      defaultServices: otherPods.map((p) => p.service),
     };
   }
 }
