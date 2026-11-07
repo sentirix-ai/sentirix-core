@@ -493,4 +493,28 @@ export class TicketsService {
       return ticket;
     }
   }
+
+  async cleanupDemoTickets(): Promise<{ count: number }> {
+    let count = 0;
+    try {
+      const deleteResult = await this.prisma.ticket.deleteMany({
+        where: {
+          tags: {
+            hasSome: ['inbound-portal', 'demo-showcase'],
+          },
+        },
+      });
+      count = deleteResult.count;
+    } catch {
+      const initial = this.memoryTickets.length;
+      this.memoryTickets = this.memoryTickets.filter(
+        (t) => !t.tags.includes('inbound-portal') && !t.tags.includes('demo-showcase'),
+      );
+      count = initial - this.memoryTickets.length;
+    }
+
+    this.logger.log(`Cleaned up ${count} demo tickets from database/cache.`);
+    this.eventsGateway.server?.emit('tickets:reloaded');
+    return { count };
+  }
 }

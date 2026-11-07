@@ -79,4 +79,10 @@ export class TicketsController {
   ): Promise<TicketRecord> {
     return this.ticketsService.transferPod(id, dto.targetPodId, dto.handoverNote, dto.actorId);
   }
+
+  @Post('demo/cleanup')
+  @ApiOperation({ summary: 'Clean up all demo showcase tickets' })
+  async cleanupDemo(): Promise<{ count: number }> {
+    return this.ticketsService.cleanupDemoTickets();
+  }
 }
