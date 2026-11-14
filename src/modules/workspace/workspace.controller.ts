@@ -271,7 +271,7 @@ export class WorkspaceController {
   @Post('regenerate-token')
   async regenerateToken(@Body() body: { token?: string; identifier?: string }) {
     if (body?.token && body.token.trim() !== '') {
-      return this.workspaceService.regenerateToken(body.token);
+      return this.workspaceService.regenerateToken(body.token, body.identifier);
     }
     if (body?.identifier && body.identifier.trim() !== '') {
       const ws = await this.workspaceService.getOrCreateUserWorkspace(body.identifier);
