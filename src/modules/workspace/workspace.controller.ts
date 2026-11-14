@@ -284,5 +284,64 @@ export class WorkspaceController {
     }
     throw new BadRequestException('Either token or identifier is required.');
   }
+
+  /**
+   * Super Admin Authority: Rename Leader or Member Personnel
+   */
+  @Post('rename-personnel')
+  async renamePersonnel(
+    @Body() body: { userId: string; newFullName: string },
+  ) {
+    if (!body?.userId || !body?.newFullName?.trim()) {
+      throw new BadRequestException('userId and newFullName are required.');
+    }
+    return this.workspaceService.renamePersonnel(body.userId, body.newFullName);
+  }
+
+  /**
+   * Super Admin Authority: Transfer / Reassign Personnel Across Pods (Mutasi Kerja)
+   */
+  @Post('transfer-personnel')
+  async transferPersonnel(
+    @Body()
+    body: {
+      userId: string;
+      targetWorkspaceId: string;
+      targetRole?: string;
+    },
+  ) {
+    if (!body?.userId || !body?.targetWorkspaceId) {
+      throw new BadRequestException(
+        'userId and targetWorkspaceId are required.',
+      );
+    }
+    return this.workspaceService.transferPersonnel(body);
+  }
+
+  /**
+   * Super Admin Authority: Promote an Agent to Leader in the same Pod (Role Switch)
+   */
+  @Post('promote-leader')
+  async promoteLeader(
+    @Body() body: { userId: string; workspaceId: string },
+  ) {
+    if (!body?.userId || !body?.workspaceId) {
+      throw new BadRequestException('userId and workspaceId are required.');
+    }
+    return this.workspaceService.promoteToLeader(body);
+  }
+
+  /**
+   * Super Admin Authority: 1-to-1 Cross-Pod Swap (Strict Fixed Capacity)
+   */
+  @Post('swap-personnel')
+  async swapPersonnel(
+    @Body() body: { userAId: string; userBId: string },
+  ) {
+    if (!body?.userAId || !body?.userBId) {
+      throw new BadRequestException('userAId and userBId are required.');
+    }
+    return this.workspaceService.swapPersonnel(body);
+  }
 }
 

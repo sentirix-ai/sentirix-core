@@ -1432,15 +1432,6 @@ export class WorkspaceService {
       };
     }
 
-    if (tokenRecord.isUsed) {
-      return {
-        valid: false,
-        isUsed: true,
-        error: `This leader activation token has already been claimed by ${tokenRecord.usedBy || 'another user'} on ${tokenRecord.usedAt ? new Date(tokenRecord.usedAt).toLocaleString() : 'earlier'}. Each token can only be claimed once.`,
-        workspaceName: tokenRecord.workspace?.name,
-      };
-    }
-
     const currentWorkspace = tokenRecord.workspace;
     const organization = currentWorkspace?.organization;
 
@@ -1448,6 +1439,25 @@ export class WorkspaceService {
       return {
         valid: false,
         error: 'Associated organization not found.',
+      };
+    }
+
+    const activeLeaderMember = currentWorkspace?.members?.find(
+      (m: any) => m.role === 'LEADER',
+    );
+    const isExistingLeader = !!activeLeaderMember || !!tokenRecord.usedBy;
+    const existingLeaderName =
+      activeLeaderMember?.user?.fullName ||
+      activeLeaderMember?.user?.username ||
+      tokenRecord.usedBy ||
+      null;
+
+    if (tokenRecord.isUsed && !isExistingLeader) {
+      return {
+        valid: false,
+        isUsed: true,
+        error: `This leader activation token has already been claimed by ${tokenRecord.usedBy || 'another user'} on ${tokenRecord.usedAt ? new Date(tokenRecord.usedAt).toLocaleString() : 'earlier'}. Each token can only be claimed once.`,
+        workspaceName: tokenRecord.workspace?.name,
       };
     }
 
@@ -1492,16 +1502,6 @@ export class WorkspaceService {
           { length: maxSubordinatesAllowed },
           (_, i) => i + 1,
         );
-
-    const activeLeaderMember = currentWorkspace.members?.find(
-      (m: any) => m.role === 'LEADER',
-    );
-    const isExistingLeader = !!activeLeaderMember;
-    const existingLeaderName =
-      activeLeaderMember?.user?.fullName ||
-      activeLeaderMember?.user?.username ||
-      tokenRecord.usedBy ||
-      null;
 
     return {
       valid: true,
@@ -1902,7 +1902,9 @@ export class WorkspaceService {
       };
     }
 
-    if (tokenRecord.isUsed) {
+    const isReturningAgent = !!tokenRecord.usedBy;
+
+    if (tokenRecord.isUsed && !isReturningAgent) {
       return {
         valid: false,
         isUsed: true,
@@ -2719,6 +2721,414 @@ export class WorkspaceService {
       workspaceId: tokenRecord.workspaceId,
       workspaceName: tokenRecord.workspace.name,
       joinUrl: `http://localhost:3000/join?token=${newTokenStr}`,
+    };
+  }
+
+  /**
+   * Super Admin Authority: Rename Leader or Member
+   */
+  async renamePersonnel(userId: string, newFullName: string) {
+    if (!userId || !newFullName || newFullName.trim() === '') {
+      throw new BadRequestException('User ID and valid new full name are required.');
+    }
+
+    const cleanName = newFullName.trim();
+    const existing = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!existing) {
+      throw new NotFoundException(`User with ID ${userId} not found.`);
+    }
+
+    const previousName = existing.fullName;
+    const updated = await this.prisma.user.update({
+      where: { id: userId },
+      data: { fullName: cleanName },
+    });
+
+    // Also update usedBy in workspaceInviteToken if present
+    await this.prisma.workspaceInviteToken.updateMany({
+      where: {
+        OR: [
+          { usedBy: previousName },
+          { usedBy: existing.username },
+        ],
+      },
+      data: { usedBy: cleanName },
+    });
+
+    return {
+      success: true,
+      message: `Successfully renamed personnel to ${cleanName}`,
+      user: {
+        id: updated.id,
+        fullName: updated.fullName,
+        username: updated.username,
+        role: updated.role,
+      },
+    };
+  }
+
+  /**
+   * Super Admin Authority: Transfer / Reassign Personnel Across Pods (Mutasi Kerja)
+   */
+  async transferPersonnel(dto: {
+    userId: string;
+    targetWorkspaceId: string;
+    targetRole?: string;
+  }) {
+    const { userId, targetWorkspaceId, targetRole } = dto;
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        workspaceMembership: {
+          include: { workspace: true },
+        },
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException(`User with ID ${userId} not found.`);
+    }
+
+    const targetWorkspace = await this.prisma.workspace.findUnique({
+      where: { id: targetWorkspaceId },
+      include: {
+        members: { include: { user: true } },
+      },
+    });
+
+    if (!targetWorkspace) {
+      throw new NotFoundException(`Target Pod with ID ${targetWorkspaceId} not found.`);
+    }
+
+    const currentMembership = user.workspaceMembership;
+    const sourceWorkspaceId = currentMembership?.workspaceId;
+
+    if (sourceWorkspaceId === targetWorkspaceId) {
+      throw new BadRequestException('User is already assigned to this operational pod.');
+    }
+
+    const sourceWorkspace = sourceWorkspaceId
+      ? await this.prisma.workspace.findUnique({
+          where: { id: sourceWorkspaceId },
+          include: { members: { include: { user: true } } },
+        })
+      : null;
+
+    // Determine normalized role
+    const newRole = targetRole
+      ? targetRole.toUpperCase() === 'LEADER'
+        ? 'LEADER'
+        : 'AGENT'
+      : currentMembership?.role === 'LEADER'
+      ? 'LEADER'
+      : 'AGENT';
+
+    // 1. If moving as LEADER to target workspace, and target already has a leader, demote old leader
+    if (newRole === 'LEADER') {
+      const existingLeaderMember = targetWorkspace.members.find(
+        (m) => m.role === 'LEADER' && m.userId !== userId,
+      );
+      if (existingLeaderMember) {
+        await this.prisma.workspaceMember.update({
+          where: { id: existingLeaderMember.id },
+          data: { role: 'AGENT' },
+        });
+        await this.prisma.user.update({
+          where: { id: existingLeaderMember.userId },
+          data: { role: 'AGENT' },
+        });
+      }
+    }
+
+    // 2. Auto-balance quotas between source and target workspace
+    if (sourceWorkspace) {
+      const newSourceQuota = Math.max(1, sourceWorkspace.assignedQuota - 1);
+      const newTargetQuota = targetWorkspace.assignedQuota + 1;
+
+      await this.prisma.workspace.update({
+        where: { id: sourceWorkspace.id },
+        data: { assignedQuota: newSourceQuota },
+      });
+
+      await this.prisma.workspace.update({
+        where: { id: targetWorkspace.id },
+        data: { assignedQuota: newTargetQuota },
+      });
+    }
+
+    // 3. Upsert or update WorkspaceMember
+    if (currentMembership) {
+      await this.prisma.workspaceMember.update({
+        where: { id: currentMembership.id },
+        data: {
+          workspaceId: targetWorkspaceId,
+          role: newRole,
+          joinedAt: new Date(),
+        },
+      });
+    } else {
+      await this.prisma.workspaceMember.create({
+        data: {
+          userId: user.id,
+          workspaceId: targetWorkspaceId,
+          role: newRole,
+        },
+      });
+    }
+
+    // 4. Update User role
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: { role: 'AGENT' },
+    });
+
+    // 5. Update active UserActivitySession
+    await this.prisma.userActivitySession.updateMany({
+      where: {
+        userId: user.id,
+        isOnline: true,
+      },
+      data: {
+        workspaceId: targetWorkspaceId,
+        role: newRole,
+      },
+    });
+
+    // 6. Release any currently open assigned tickets in old pod back to unassigned queue
+    if (sourceWorkspaceId) {
+      await this.prisma.ticket.updateMany({
+        where: {
+          workspaceId: sourceWorkspaceId,
+          assignedAgentId: user.id,
+          status: { in: ['NEW', 'OPEN', 'PENDING'] },
+        },
+        data: {
+          assignedAgentId: null,
+          status: 'OPEN',
+        },
+      });
+    }
+
+    this.logger.log(
+      `Transferred personnel ${user.fullName || user.username} (${user.id}) from ${sourceWorkspace?.name || 'None'} to ${targetWorkspace.name} as ${newRole}`,
+    );
+
+    return {
+      success: true,
+      message: `Successfully transferred ${user.fullName || user.username} to ${targetWorkspace.name}`,
+      user: {
+        id: user.id,
+        fullName: user.fullName || user.username,
+        role: newRole,
+        workspaceId: targetWorkspaceId,
+        podName: targetWorkspace.name,
+      },
+      sourceWorkspace: sourceWorkspace ? { id: sourceWorkspace.id, name: sourceWorkspace.name } : null,
+      targetWorkspace: { id: targetWorkspace.id, name: targetWorkspace.name },
+    };
+  }
+
+  /**
+   * Super Admin Authority: Promote an Agent to Leader in the same Pod (Internal Role Switch)
+   * The current leader is automatically demoted to Frontline Agent. Total Pod capacity remains strictly FIX.
+   */
+  async promoteToLeader(dto: {
+    userId: string;
+    workspaceId: string;
+  }) {
+    const { userId, workspaceId } = dto;
+
+    const workspace = await this.prisma.workspace.findUnique({
+      where: { id: workspaceId },
+      include: {
+        members: { include: { user: true } },
+      },
+    });
+
+    if (!workspace) {
+      throw new NotFoundException(`Pod with ID ${workspaceId} not found.`);
+    }
+
+    const targetMember = workspace.members.find((m) => m.userId === userId);
+    if (!targetMember) {
+      throw new NotFoundException(`Personnel with ID ${userId} is not assigned to this pod.`);
+    }
+
+    if (targetMember.role === 'LEADER') {
+      throw new BadRequestException('This personnel is already the Leader of this pod.');
+    }
+
+    // Find the current active leader in this pod
+    const currentLeaderMember = workspace.members.find((m) => m.role === 'LEADER');
+
+    // 1. Demote current leader to AGENT
+    if (currentLeaderMember) {
+      await this.prisma.workspaceMember.update({
+        where: { id: currentLeaderMember.id },
+        data: { role: 'AGENT' },
+      });
+      await this.prisma.userActivitySession.updateMany({
+        where: { userId: currentLeaderMember.userId, isOnline: true },
+        data: { role: 'AGENT' },
+      });
+    }
+
+    // 2. Promote targetMember to LEADER
+    await this.prisma.workspaceMember.update({
+      where: { id: targetMember.id },
+      data: { role: 'LEADER' },
+    });
+    await this.prisma.userActivitySession.updateMany({
+      where: { userId: targetMember.userId, isOnline: true },
+      data: { role: 'LEADER' },
+    });
+
+    const newLeaderName = targetMember.user.fullName || targetMember.user.username;
+
+    this.logger.log(
+      `Promoted ${newLeaderName} to Leader of ${workspace.name}. Demoted previous leader ${currentLeaderMember?.user.fullName || 'None'} to Agent.`,
+    );
+
+    return {
+      success: true,
+      message: `Successfully promoted ${newLeaderName} to Pod Leader of ${workspace.name}.`,
+      newLeader: {
+        id: targetMember.userId,
+        fullName: newLeaderName,
+        role: 'LEADER',
+      },
+      demotedLeader: currentLeaderMember
+        ? {
+            id: currentLeaderMember.userId,
+            fullName: currentLeaderMember.user.fullName || currentLeaderMember.user.username,
+            role: 'AGENT',
+          }
+        : null,
+      workspace: {
+        id: workspace.id,
+        name: workspace.name,
+        leaderName: newLeaderName,
+      },
+    };
+  }
+
+  /**
+   * Super Admin Authority: 1-to-1 Cross-Pod Swap (Strict Fixed Capacity)
+   * Exchanges User A (from Pod A) with User B (from Pod B).
+   * Capacities of both Pods remain strictly FIX (0 change).
+   */
+  async swapPersonnel(dto: {
+    userAId: string;
+    userBId: string;
+  }) {
+    const { userAId, userBId } = dto;
+
+    if (userAId === userBId) {
+      throw new BadRequestException('Cannot swap a personnel with themselves.');
+    }
+
+    const memberA = await this.prisma.workspaceMember.findUnique({
+      where: { userId: userAId },
+      include: { user: true, workspace: true },
+    });
+
+    const memberB = await this.prisma.workspaceMember.findUnique({
+      where: { userId: userBId },
+      include: { user: true, workspace: true },
+    });
+
+    if (!memberA || !memberB) {
+      throw new NotFoundException('One or both personnel memberships were not found.');
+    }
+
+    if (memberA.workspaceId === memberB.workspaceId) {
+      throw new BadRequestException(
+        'Both personnel are in the same pod. Use internal role switch instead.',
+      );
+    }
+
+    const workspaceAId = memberA.workspaceId;
+    const workspaceBId = memberB.workspaceId;
+    const workspaceAName = memberA.workspace.name;
+    const workspaceBName = memberB.workspace.name;
+
+    const roleA = memberA.role;
+    const roleB = memberB.role;
+
+    // 1. Swap workspaceId and role
+    await this.prisma.workspaceMember.update({
+      where: { id: memberA.id },
+      data: {
+        workspaceId: workspaceBId,
+        role: roleB,
+        joinedAt: new Date(),
+      },
+    });
+
+    await this.prisma.workspaceMember.update({
+      where: { id: memberB.id },
+      data: {
+        workspaceId: workspaceAId,
+        role: roleA,
+        joinedAt: new Date(),
+      },
+    });
+
+    // 2. Update active sessions
+    await this.prisma.userActivitySession.updateMany({
+      where: { userId: userAId, isOnline: true },
+      data: { workspaceId: workspaceBId, role: roleB },
+    });
+
+    await this.prisma.userActivitySession.updateMany({
+      where: { userId: userBId, isOnline: true },
+      data: { workspaceId: workspaceAId, role: roleA },
+    });
+
+    // 3. Unassign open tickets in old pods
+    await this.prisma.ticket.updateMany({
+      where: {
+        workspaceId: workspaceAId,
+        assignedAgentId: userAId,
+        status: { in: ['NEW', 'OPEN', 'PENDING'] },
+      },
+      data: { assignedAgentId: null, status: 'OPEN' },
+    });
+
+    await this.prisma.ticket.updateMany({
+      where: {
+        workspaceId: workspaceBId,
+        assignedAgentId: userBId,
+        status: { in: ['NEW', 'OPEN', 'PENDING'] },
+      },
+      data: { assignedAgentId: null, status: 'OPEN' },
+    });
+
+    const nameA = memberA.user.fullName || memberA.user.username;
+    const nameB = memberB.user.fullName || memberB.user.username;
+
+    this.logger.log(
+      `Swapped ${nameA} (${workspaceAName}) with ${nameB} (${workspaceBName}). Pod capacities remain strictly fixed.`,
+    );
+
+    return {
+      success: true,
+      message: `Successfully swapped ${nameA} and ${nameB} between pods. Capacity remains strictly fixed.`,
+      userA: {
+        id: userAId,
+        fullName: nameA,
+        newPodName: workspaceBName,
+        newRole: roleB,
+      },
+      userB: {
+        id: userBId,
+        fullName: nameB,
+        newPodName: workspaceAName,
+        newRole: roleA,
+      },
     };
   }
 }
