@@ -2155,11 +2155,37 @@ export class WorkspaceService {
       },
     });
 
-    if (!user || !user.organization) {
-      throw new NotFoundException('Organization not found for this administrator.');
+    let org = user?.organization;
+    if (!org && user) {
+      org = await this.prisma.organization.findFirst({
+        include: {
+          workspaces: {
+            include: {
+              members: { include: { user: true } },
+              tickets: {
+                include: {
+                  messages: {
+                    orderBy: { createdAt: 'asc' },
+                  },
+                },
+              },
+              inviteTokens: { orderBy: { createdAt: 'desc' } },
+            },
+            orderBy: { createdAt: 'asc' },
+          },
+        },
+      });
+      if (org && user.id) {
+        await this.prisma.user.update({
+          where: { id: user.id },
+          data: { organizationId: org.id },
+        });
+      }
     }
 
-    const org = user.organization;
+    if (!user || !org) {
+      throw new NotFoundException('Organization not found for this administrator.');
+    }
     const workspaces = org.workspaces || [];
     const now = Date.now();
 
@@ -3310,6 +3336,175 @@ export class WorkspaceService {
         newPodName: workspaceAName,
         newRole: roleA,
       },
+    };
+  }
+
+  /**
+   * Super Admin Monetization & Expansion: Deploy a Specialized Pod ($149/mo)
+   */
+  async createSpecializedPod(dto: {
+    name: string;
+    podCategory?: string;
+    description?: string;
+    services?: string[];
+    quota?: number;
+    organizationId?: string;
+  }) {
+    const cleanName = (dto.name || '').trim();
+    if (!cleanName) {
+      throw new BadRequestException('Pod name is required.');
+    }
+
+    // Find the primary organization or fallback
+    let org = null;
+    if (dto.organizationId) {
+      org = await this.prisma.organization.findUnique({
+        where: { id: dto.organizationId },
+      });
+    }
+    if (!org) {
+      org = await this.prisma.organization.findFirst({
+        orderBy: { createdAt: 'asc' },
+      });
+    }
+
+    // Find the super admin owner (e.g., @pungkyrama or first admin)
+    const owner = await this.prisma.user.findFirst({
+      where: {
+        OR: [
+          { username: 'pungkyrama' },
+          { role: 'ADMIN' },
+        ],
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (!owner) {
+      throw new BadRequestException('No admin owner found to anchor new specialized pod.');
+    }
+
+    const leaderTokenStr =
+      'STX-LDR-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+
+    const assignedQuota = Math.max(1, Math.min(dto.quota || 3, 50));
+
+    const workspace = await this.prisma.workspace.create({
+      data: {
+        name: cleanName,
+        podCategory: dto.podCategory || 'ENTERPRISE_VIP',
+        description: dto.description || null,
+        services: dto.services && dto.services.length > 0 ? dto.services : ['VIP Priority Escalation', 'Dispute Resolution'],
+        maxMembers: assignedQuota,
+        assignedQuota: assignedQuota,
+        isQuotaLocked: false,
+        inviteToken: leaderTokenStr,
+        ownerId: owner.id,
+        organizationId: org?.id || owner.organizationId || null,
+        inviteTokens: {
+          create: {
+            token: leaderTokenStr,
+            role: 'LEADER',
+            isUsed: false,
+          },
+        },
+      },
+      include: {
+        inviteTokens: true,
+      },
+    });
+
+    this.logger.log(
+      `Super Admin created specialized pod "${cleanName}" (${workspace.id}) with initial quota ${assignedQuota} and Leader Token ${leaderTokenStr}.`,
+    );
+
+    return {
+      success: true,
+      message: `Specialized Pod "${cleanName}" provisioned successfully.`,
+      workspace: {
+        id: workspace.id,
+        name: workspace.name,
+        podCategory: workspace.podCategory,
+        services: workspace.services,
+        assignedQuota: workspace.assignedQuota,
+        isQuotaLocked: workspace.isQuotaLocked,
+      },
+      leaderToken: leaderTokenStr,
+    };
+  }
+
+  /**
+   * Super Admin Monetization & Expansion: Add Frontline Seats to a Pod (+$30/seat/mo)
+   */
+  async addSeatToPod(dto: {
+    workspaceId: string;
+    seatCount: number;
+  }) {
+    if (!dto.workspaceId) {
+      throw new BadRequestException('workspaceId is required.');
+    }
+    const count = Math.max(1, Math.min(Number(dto.seatCount) || 1, 20));
+
+    const workspace = await this.prisma.workspace.findUnique({
+      where: { id: dto.workspaceId },
+      include: {
+        members: true,
+        inviteTokens: true,
+      },
+    });
+
+    if (!workspace) {
+      throw new BadRequestException('Workspace pod not found.');
+    }
+
+    const newAssignedQuota = (workspace.assignedQuota || workspace.maxMembers || 0) + count;
+    const newMaxMembers = (workspace.maxMembers || 0) + count;
+
+    // Update workspace quota
+    const updatedWorkspace = await this.prisma.workspace.update({
+      where: { id: workspace.id },
+      data: {
+        assignedQuota: newAssignedQuota,
+        maxMembers: newMaxMembers,
+      },
+    });
+
+    // Auto-generate pristine single-use agent tokens for each new seat
+    const generatedTokens: { token: string; role: string; joinUrl: string }[] = [];
+    for (let i = 0; i < count; i++) {
+      const agtTokenStr =
+        'STX-AGT-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+
+      const agt = await this.prisma.workspaceInviteToken.create({
+        data: {
+          workspaceId: workspace.id,
+          token: agtTokenStr,
+          role: 'AGENT',
+          isUsed: false,
+        },
+      });
+
+      generatedTokens.push({
+        token: agt.token,
+        role: agt.role,
+        joinUrl: `http://localhost:3000/join?token=${agt.token}`,
+      });
+    }
+
+    this.logger.log(
+      `Super Admin added ${count} seat(s) to Pod "${workspace.name}" (New quota: ${newAssignedQuota}). Generated ${generatedTokens.length} single-use tokens.`,
+    );
+
+    return {
+      success: true,
+      message: `Expanded ${workspace.name} capacity by ${count} seat(s). Total quota is now ${newAssignedQuota} staff.`,
+      workspace: {
+        id: updatedWorkspace.id,
+        name: updatedWorkspace.name,
+        assignedQuota: updatedWorkspace.assignedQuota,
+        maxMembers: updatedWorkspace.maxMembers,
+        isQuotaLocked: updatedWorkspace.isQuotaLocked,
+      },
+      newTokens: generatedTokens,
     };
   }
 }

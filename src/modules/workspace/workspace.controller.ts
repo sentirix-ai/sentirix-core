@@ -343,5 +343,43 @@ export class WorkspaceController {
     }
     return this.workspaceService.swapPersonnel(body);
   }
+
+  /**
+   * Super Admin Monetization & Expansion: Deploy a Specialized Pod ($149/mo)
+   */
+  @Post('create-pod')
+  async createPod(
+    @Body()
+    body: {
+      name: string;
+      podCategory?: string;
+      description?: string;
+      services?: string[];
+      quota?: number;
+      organizationId?: string;
+    },
+  ) {
+    if (!body?.name?.trim()) {
+      throw new BadRequestException('Pod name is required.');
+    }
+    return this.workspaceService.createSpecializedPod(body);
+  }
+
+  /**
+   * Super Admin Monetization & Expansion: Add Frontline Seats to a Pod (+$30/seat/mo)
+   */
+  @Post('add-seat')
+  async addSeat(
+    @Body()
+    body: {
+      workspaceId: string;
+      seatCount: number;
+    },
+  ) {
+    if (!body?.workspaceId) {
+      throw new BadRequestException('workspaceId is required.');
+    }
+    return this.workspaceService.addSeatToPod(body);
+  }
 }
 

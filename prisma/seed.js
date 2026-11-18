@@ -3,7 +3,7 @@ import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
 
 async function main() {
-  console.log('Seeding PostgreSQL db_sentrix...');
+  console.log('Seeding PostgreSQL db_sentirix...');
 
   // 1. Seed Admin User
   const admin = await prisma.user.upsert({
@@ -146,7 +146,7 @@ async function main() {
     });
   }
 
-  console.log('Seeding completed successfully in db_sentrix!');
+  console.log('Seeding completed successfully in db_sentirix!');
 }
 
 main()

@@ -205,8 +205,8 @@ export class AuthService implements OnModuleInit {
   }
 
   async register(dto: RegisterDto): Promise<AuthUserResponse> {
-    const lowerUsername = dto.username.toLowerCase();
-    const lowerEmail = dto.email.toLowerCase();
+    const lowerUsername = dto.username.toLowerCase().trim();
+    const lowerEmail = dto.email.toLowerCase().trim();
 
     // Prevent overriding admin
     if (lowerUsername === 'pungkyrama') {
@@ -217,7 +217,7 @@ export class AuthService implements OnModuleInit {
     const userId = `usr-${Date.now().toString(36)}`;
 
     try {
-      // 1. Check unique in PostgreSQL database first
+      // 1. Check unique in PostgreSQL database first (Strict Case-Insensitive)
       const existingDbUser = await this.prisma.user.findFirst({
         where: {
           OR: [
@@ -228,33 +228,36 @@ export class AuthService implements OnModuleInit {
       });
 
       if (existingDbUser) {
-        throw new BadRequestException('An account with this username or email already exists.');
+        if (existingDbUser.username?.toLowerCase() === lowerUsername) {
+          throw new BadRequestException(`Username "@${lowerUsername}" is already registered. Please choose another username or log in.`);
+        }
+        throw new BadRequestException(`An account with email "${lowerEmail}" is already registered. Please log in.`);
       }
 
-      // 2. Insert into PostgreSQL
+      // 2. Insert into PostgreSQL with normalized lowercase username and email
       const dbUser = await this.prisma.user.create({
         data: {
-          username: dto.username,
-          fullName: dto.username,
-          email: dto.email,
-          phone: dto.phone,
+          username: lowerUsername,
+          fullName: lowerUsername,
+          email: lowerEmail,
+          phone: dto.phone?.trim(),
           passwordHash,
           role: 'CUSTOMER', // Default user role
           verificationMethod: dto.verificationMethod || 'EMAIL',
         },
       });
 
-      this.logger.log(`User @${dto.username} registered successfully in PostgreSQL db_omniflow.`);
+      this.logger.log(`User @${lowerUsername} registered successfully in PostgreSQL db_sentirix.`);
 
       return {
         id: dbUser.id,
-        username: dbUser.username || dto.username,
+        username: dbUser.username || lowerUsername,
         email: dbUser.email,
         phone: dbUser.phone || dto.phone,
         role: 'USER',
         verificationMethod: dto.verificationMethod,
         isVerified: true,
-        avatarText: (dbUser.username || dto.username).slice(0, 2).toUpperCase(),
+        avatarText: (dbUser.username || lowerUsername).slice(0, 2).toUpperCase(),
         token: this.generateToken(dbUser.id, 'USER'),
         onboardingCompleted: false,
       };
@@ -265,20 +268,23 @@ export class AuthService implements OnModuleInit {
 
       this.logger.warn(`Database insert failed, using memory store: ${(err as Error)?.message}`);
 
-      // Check unique in memory
+      // Check unique in memory (Strict Case-Insensitive)
       const memoryDuplicate = this.memoryUsers.find(
         (u) => u.username.toLowerCase() === lowerUsername || u.email.toLowerCase() === lowerEmail,
       );
       if (memoryDuplicate) {
-        throw new BadRequestException('An account with this username or email already exists.');
+        if (memoryDuplicate.username.toLowerCase() === lowerUsername) {
+          throw new BadRequestException(`Username "@${lowerUsername}" is already registered. Please choose another username or log in.`);
+        }
+        throw new BadRequestException(`An account with email "${lowerEmail}" is already registered. Please log in.`);
       }
 
-      // Memory fallback
+      // Memory fallback with normalized lowercase
       const newUser: StoredMemoryUser = {
         id: userId,
-        username: dto.username,
-        email: dto.email,
-        phone: dto.phone,
+        username: lowerUsername,
+        email: lowerEmail,
+        phone: dto.phone?.trim(),
         passwordHash,
         role: 'USER',
         verificationMethod: dto.verificationMethod,
@@ -288,7 +294,7 @@ export class AuthService implements OnModuleInit {
       };
 
       this.memoryUsers.push(newUser);
-      this.logger.log(`User @${dto.username} registered successfully (Memory Store).`);
+      this.logger.log(`User @${lowerUsername} registered successfully (Memory Store).`);
 
       return {
         id: newUser.id,

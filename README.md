@@ -115,7 +115,7 @@ cp .env.example .env
 Update your `.env` with your Gemini API key and credentials:
 ```env
 PORT=4000
-DATABASE_URL="postgresql://postgres:postgres@localhost:5432/db_sentrix?schema=public"
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/db_sentirix?schema=public"
 JWT_SECRET="your-ultra-secure-jwt-secret-min-32-chars"
 GEMINI_API_KEY="your-google-gemini-api-key"
 CORS_ORIGIN="http://localhost:3000"
