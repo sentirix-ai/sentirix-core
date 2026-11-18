@@ -41,9 +41,33 @@ export interface WorkspaceDetailResponse {
   members: WorkspaceMemberInfo[];
 }
 
+const CORPORATE_ACRONYMS = new Set([
+  'PT', 'CV', 'UD', 'TBK', 'LLC', 'LTD', 'GMBH', 'PTE', 'USA', 'UK', 'ID', 'BCA', 'BRI', 'BNI', 'IBM', 'AWS', 'NASA', 'SAP', 'AI', 'IT', 'HQ'
+]);
+
+function formatCorporateTitleCase(input: string): string {
+  if (!input) return '';
+  const clean = input.trim().replace(/\s+/g, ' ');
+  return clean
+    .split(' ')
+    .filter(Boolean)
+    .map((word) => {
+      const upper = word.toUpperCase();
+      if (CORPORATE_ACRONYMS.has(upper)) return upper;
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    })
+    .join(' ');
+}
+
 @Injectable()
 export class WorkspaceService {
   private readonly logger = new Logger(WorkspaceService.name);
+
+  // First-Open Browser Session Lock: Only 1 browser session can open and claim each single-use token
+  private tokenOpenSessionLocks = new Map<
+    string,
+    { sessionId: string; openedAt: Date }
+  >();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -380,7 +404,7 @@ export class WorkspaceService {
   /**
    * Validate an invite link by single-use token
    */
-  async validateInvite(token: string) {
+  async validateInvite(token: string, sessionId?: string) {
     if (!token || token.trim() === '') {
       throw new BadRequestException('Invite token is required.');
     }
@@ -436,6 +460,32 @@ export class WorkspaceService {
         workspaceName: tokenRecord.workspace.name,
         ownerName: tokenRecord.workspace.owner.fullName || tokenRecord.workspace.owner.username,
       };
+    }
+
+    // First-Open Browser Session Lock: Disallow simultaneous opening in a second browser (PostgreSQL Persisted)
+    if (tokenRecord.openedBySession) {
+      const isExpired =
+        tokenRecord.openedAt &&
+        Date.now() - new Date(tokenRecord.openedAt).getTime() > 30 * 60 * 1000;
+      if (!isExpired && tokenRecord.openedBySession !== sessionId) {
+        return {
+          valid: false,
+          isLockedToOtherSession: true,
+          error:
+            'This single-use invitation link is currently active in another browser session. To protect organization security, simultaneous or duplicate access is prohibited. Please request a fresh invitation link from your Super Admin.',
+          workspaceName: tokenRecord.workspace.name,
+          ownerName: tokenRecord.workspace.owner.fullName || tokenRecord.workspace.owner.username,
+        };
+      }
+    } else if (sessionId) {
+      await this.prisma.workspaceInviteToken.update({
+        where: { id: tokenRecord.id },
+        data: {
+          openedBySession: sessionId,
+          openedAt: new Date(),
+        },
+      });
+      this.logger.log(`[TokenLock] Token "${cleanToken}" bound to session "${sessionId}" in PostgreSQL.`);
     }
 
     const memberCount = tokenRecord.workspace.members.length;
@@ -976,7 +1026,9 @@ export class WorkspaceService {
       throw new NotFoundException(`User ${dto.identifier} not found.`);
     }
 
-    const orgName = dto.organizationName?.trim() || `${user.fullName || user.username}'s Enterprise`;
+    const orgName =
+      formatCorporateTitleCase(dto.organizationName || '') ||
+      `${user.fullName || user.username}'s Enterprise`;
 
     // 1. Create or Update Organization
     let organization = user.organization;
@@ -1279,7 +1331,7 @@ export class WorkspaceService {
     }
 
     const orgName =
-      dto.organizationName?.trim() ||
+      formatCorporateTitleCase(dto.organizationName || '') ||
       `${user.fullName || user.username}'s Organization`;
 
     // 1. Create or Update Organization
@@ -1308,13 +1360,13 @@ export class WorkspaceService {
       });
     }
 
-    // 2. Link User to Organization as ADMIN
+    // 2. Link User to Organization as ADMIN (Onboarding will only complete once Done Sharing is clicked)
     await this.prisma.user.update({
       where: { id: user.id },
       data: {
         organizationId: organization.id,
         role: 'ADMIN',
-        onboardingCompleted: true,
+        onboardingCompleted: false,
       },
     });
 
@@ -1410,7 +1462,7 @@ export class WorkspaceService {
   /**
    * Get dynamic interconnected quota status for a Leader token
    */
-  async getLeaderTokenQuotaStatus(token: string) {
+  async getLeaderTokenQuotaStatus(token: string, sessionId?: string) {
     if (!token || token.trim() === '') {
       throw new BadRequestException('Token is required.');
     }
@@ -1469,6 +1521,33 @@ export class WorkspaceService {
         error: `This leader activation token has already been claimed by ${tokenRecord.usedBy || 'another user'} on ${tokenRecord.usedAt ? new Date(tokenRecord.usedAt).toLocaleString() : 'earlier'}. Each token can only be claimed once.`,
         workspaceName: tokenRecord.workspace?.name,
       };
+    }
+
+    // First-Open Browser Session Lock: Disallow simultaneous opening in a second browser (PostgreSQL Persisted)
+    if (tokenRecord.openedBySession && !isExistingLeader) {
+      const isExpired =
+        tokenRecord.openedAt &&
+        Date.now() - new Date(tokenRecord.openedAt).getTime() > 30 * 60 * 1000;
+      if (!isExpired && tokenRecord.openedBySession !== sessionId) {
+        return {
+          valid: false,
+          isLockedToOtherSession: true,
+          error:
+            'This single-use invitation link is currently active in another browser session. To protect organization security, simultaneous or duplicate access is prohibited. Please request a fresh invitation link from your Super Admin.',
+          workspaceName: tokenRecord.workspace?.name,
+        };
+      }
+    } else if (sessionId && !isExistingLeader && !tokenRecord.openedBySession) {
+      await this.prisma.workspaceInviteToken.update({
+        where: { id: tokenRecord.id },
+        data: {
+          openedBySession: sessionId,
+          openedAt: new Date(),
+        },
+      });
+      this.logger.log(
+        `[TokenLock] Leader token "${cleanToken}" bound to first-open browser session "${sessionId}" in PostgreSQL.`,
+      );
     }
 
     // Fetch all workspaces in this organization
@@ -1554,8 +1633,9 @@ export class WorkspaceService {
     fullName: string;
     password?: string;
     chosenSubordinates: number;
+    sessionId?: string;
   }) {
-    const { token, fullName, password, chosenSubordinates } = dto;
+    const { token, fullName, password, chosenSubordinates, sessionId } = dto;
     if (!token || !fullName || fullName.trim().length < 2) {
       throw new BadRequestException('Please provide a valid token and full name.');
     }
@@ -1563,8 +1643,21 @@ export class WorkspaceService {
     const cleanName = fullName.trim();
     const chosenCount = Number(chosenSubordinates) || 1;
 
+    // Verify First-Open Browser Session Lock
+    if (sessionId) {
+      const activeLock = this.tokenOpenSessionLocks.get(cleanToken);
+      if (activeLock) {
+        const isExpired = Date.now() - activeLock.openedAt.getTime() > 30 * 60 * 1000;
+        if (!isExpired && activeLock.sessionId !== sessionId) {
+          throw new BadRequestException(
+            'This token is currently locked to another active browser session.',
+          );
+        }
+      }
+    }
+
     // 1. Verify token & quota limits
-    const quotaStatus = await this.getLeaderTokenQuotaStatus(cleanToken);
+    const quotaStatus = await this.getLeaderTokenQuotaStatus(cleanToken, sessionId);
     if (!quotaStatus.valid || !quotaStatus.quotaStats) {
       throw new BadRequestException(
         (quotaStatus as any).error || 'Token is not valid.',
@@ -1813,6 +1906,9 @@ export class WorkspaceService {
       },
     });
 
+    // Release session lock once permanently claimed
+    this.tokenOpenSessionLocks.delete(cleanToken);
+
     // 6. Auto-generate exactly safeCount Single-Use Agent Tokens
     const agentTokens: any[] = [];
     for (let i = 0; i < safeCount; i++) {
@@ -1877,7 +1973,7 @@ export class WorkspaceService {
   /**
    * Validate Agent Single-Use Token
    */
-  async getAgentTokenStatus(token: string) {
+  async getAgentTokenStatus(token: string, sessionId?: string) {
     if (!token || token.trim() === '') {
       throw new BadRequestException('Token is required.');
     }
@@ -1923,6 +2019,33 @@ export class WorkspaceService {
       };
     }
 
+    // First-Open Browser Session Lock: Disallow simultaneous opening in a second browser (PostgreSQL Persisted)
+    if (tokenRecord.openedBySession && !isReturningAgent) {
+      const isExpired =
+        tokenRecord.openedAt &&
+        Date.now() - new Date(tokenRecord.openedAt).getTime() > 30 * 60 * 1000;
+      if (!isExpired && tokenRecord.openedBySession !== sessionId) {
+        return {
+          valid: false,
+          isLockedToOtherSession: true,
+          error:
+            'This single-use invitation link is currently active in another browser session. To protect organization security, simultaneous or duplicate access is prohibited. Please request a fresh invitation link from your Super Admin.',
+          workspaceName: tokenRecord.workspace?.name,
+        };
+      }
+    } else if (sessionId && !isReturningAgent && !tokenRecord.openedBySession) {
+      await this.prisma.workspaceInviteToken.update({
+        where: { id: tokenRecord.id },
+        data: {
+          openedBySession: sessionId,
+          openedAt: new Date(),
+        },
+      });
+      this.logger.log(
+        `[TokenLock] Agent token "${cleanToken}" bound to first-open browser session "${sessionId}" in PostgreSQL.`,
+      );
+    }
+
     const leaderMember =
       tokenRecord.workspace?.members?.find((m: any) => m.role === 'LEADER') ||
       tokenRecord.workspace?.members[0];
@@ -1954,15 +2077,29 @@ export class WorkspaceService {
     token: string;
     fullName: string;
     password?: string;
+    sessionId?: string;
   }) {
-    const { token, fullName, password } = dto;
+    const { token, fullName, password, sessionId } = dto;
     if (!token || !fullName || fullName.trim().length < 2) {
       throw new BadRequestException('Please provide a valid token and full name.');
     }
     const cleanToken = token.trim();
     const cleanName = fullName.trim();
 
-    const agentStatus = await this.getAgentTokenStatus(cleanToken);
+    // Verify First-Open Browser Session Lock
+    if (sessionId) {
+      const activeLock = this.tokenOpenSessionLocks.get(cleanToken);
+      if (activeLock) {
+        const isExpired = Date.now() - activeLock.openedAt.getTime() > 30 * 60 * 1000;
+        if (!isExpired && activeLock.sessionId !== sessionId) {
+          throw new BadRequestException(
+            'This token is currently locked to another active browser session.',
+          );
+        }
+      }
+    }
+
+    const agentStatus = await this.getAgentTokenStatus(cleanToken, sessionId);
     if (!agentStatus.valid) {
       throw new BadRequestException(agentStatus.error || 'Token is not valid.');
     }
@@ -2065,6 +2202,8 @@ export class WorkspaceService {
         usedAt: existingMember ? (existingMember.joinedAt || new Date()) : new Date(),
       },
     });
+
+    this.tokenOpenSessionLocks.delete(cleanToken);
 
     // Start activity session for agent
     try {
@@ -2343,7 +2482,7 @@ export class WorkspaceService {
       const userRole = isSuperAdmin ? 'SUPER_ADMIN' : isLeader ? 'LEADER' : 'MEMBER';
       const podName =
         u.workspaceMembership?.workspace?.name ||
-        (isSuperAdmin ? 'Executive Cockpit' : 'Belum Ditugaskan');
+        (isSuperAdmin ? 'Executive Cockpit' : 'Unassigned');
 
       const allAssigned = (u as any).assignedTickets || [];
       const activeTickets = allAssigned.filter(
@@ -2683,6 +2822,7 @@ export class WorkspaceService {
         totalSeats: effectiveTotalSeats,
         planTier: org.planTier,
         leadershipMode: org.leadershipMode,
+        onboardingCompleted: user.onboardingCompleted ?? false,
       },
       stats: {
         totalSeats: effectiveTotalSeats,
@@ -2714,16 +2854,28 @@ export class WorkspaceService {
    * Regenerate a Single-Use Token for a Pod Leader or Frontline Agent
    * Invalidates old token and issues a fresh one
    */
-  async regenerateToken(oldToken: string, requesterIdentifier?: string) {
-    if (!oldToken || oldToken.trim() === '') {
-      throw new BadRequestException('Token is required.');
-    }
-    const cleanToken = oldToken.trim();
+  async regenerateToken(
+    oldToken?: string,
+    requesterIdentifier?: string,
+    workspaceId?: string,
+  ) {
+    const cleanToken = (oldToken || '').trim();
 
-    const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
-      where: { token: cleanToken },
-      include: { workspace: true },
-    });
+    let tokenRecord = cleanToken
+      ? await this.prisma.workspaceInviteToken.findUnique({
+          where: { token: cleanToken },
+          include: { workspace: true },
+        })
+      : null;
+
+    // Resilient fallback: If token string is stale or not found, look up active token by workspaceId
+    if (!tokenRecord && workspaceId && workspaceId.trim() !== '') {
+      tokenRecord = await this.prisma.workspaceInviteToken.findFirst({
+        where: { workspaceId: workspaceId.trim(), role: 'LEADER' },
+        include: { workspace: true },
+        orderBy: { createdAt: 'desc' },
+      });
+    }
 
     if (!tokenRecord) {
       throw new NotFoundException('Token not found.');
@@ -2814,6 +2966,8 @@ export class WorkspaceService {
         isUsed: false,
         usedBy: retainedUsedBy,
         usedAt: null,
+        openedBySession: null,
+        openedAt: null,
       },
     });
 
@@ -2824,6 +2978,9 @@ export class WorkspaceService {
         data: { inviteToken: newTokenStr },
       });
     }
+
+    // Invalidate any open session locks for the old token
+    this.tokenOpenSessionLocks.delete(cleanToken);
 
     this.logger.log(
       `Regenerated ${tokenRecord.role} token for Pod "${tokenRecord.workspace.name}": ${cleanToken} -> ${newTokenStr}`,
@@ -2838,6 +2995,130 @@ export class WorkspaceService {
       workspaceName: tokenRecord.workspace.name,
       joinUrl: `http://localhost:3000/join?token=${newTokenStr}`,
     };
+  }
+
+  /**
+   * Fetch Pending Leader Tokens directly from PostgreSQL Database for Resilient Step 4 Recovery
+   */
+  async getPendingLeaderTokens(identifier: string) {
+    if (!identifier || identifier.trim() === '') {
+      throw new BadRequestException('Identifier is required.');
+    }
+    const cleanId = identifier.trim();
+    const user = await this.prisma.user.findFirst({
+      where: {
+        OR: [
+          { id: cleanId },
+          { username: { equals: cleanId, mode: 'insensitive' } },
+          { email: { equals: cleanId, mode: 'insensitive' } },
+        ],
+      },
+      include: {
+        organization: {
+          include: {
+            workspaces: {
+              include: {
+                inviteTokens: { orderBy: { createdAt: 'desc' } },
+              },
+              orderBy: { createdAt: 'asc' },
+            },
+          },
+        },
+      },
+    });
+
+    if (!user || !user.organization) {
+      return {
+        success: true,
+        hasPendingTokens: false,
+        onboardingCompleted: user?.onboardingCompleted ?? false,
+        leaderTokens: [],
+      };
+    }
+
+    const leaderTokens: any[] = [];
+    const pods: any[] = [];
+    const allServicesSet = new Set<string>();
+    const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+    for (const ws of user.organization.workspaces || []) {
+      const leaderTok = ws.inviteTokens?.find((t) => t.role === 'LEADER') || {
+        token: ws.inviteToken,
+        isUsed: false,
+      };
+      if (leaderTok?.token) {
+        leaderTokens.push({
+          workspaceId: ws.id,
+          workspaceName: ws.name,
+          podCategory: ws.podCategory,
+          services: ws.services || [],
+          token: leaderTok.token,
+          role: 'LEADER',
+          isUsed: leaderTok.isUsed ?? false,
+          joinUrl: `${baseUrl}/join?token=${leaderTok.token}`,
+        });
+      }
+
+      pods.push({
+        name: ws.name,
+        podCategory: ws.podCategory,
+        description: ws.description || '',
+        services: ws.services || [],
+      });
+
+      if (Array.isArray(ws.services)) {
+        for (const s of ws.services) {
+          if (s && s.trim()) allServicesSet.add(s.trim());
+        }
+      }
+    }
+
+    return {
+      success: true,
+      hasPendingTokens: leaderTokens.length > 0,
+      onboardingCompleted: user.onboardingCompleted ?? false,
+      organizationName: user.organization.name,
+      industry: user.organization.industry,
+      customIndustryDescription: user.organization.customIndustryDescription,
+      totalSeats: user.organization.totalSeats,
+      pods,
+      availableServices: Array.from(allServicesSet),
+      leaderTokens,
+    };
+  }
+
+  /**
+   * Complete Onboarding upon explicit Done Sharing click
+   */
+  async completeOnboarding(identifier: string) {
+    if (!identifier || identifier.trim() === '') {
+      throw new BadRequestException('Identifier is required.');
+    }
+    const cleanId = identifier.trim();
+    const user = await this.prisma.user.findFirst({
+      where: {
+        OR: [
+          { id: cleanId },
+          { username: { equals: cleanId, mode: 'insensitive' } },
+          { email: { equals: cleanId, mode: 'insensitive' } },
+        ],
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found.');
+    }
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        role: 'ADMIN',
+        onboardingCompleted: true,
+      },
+    });
+
+    this.logger.log(`User @${user.username} officially completed onboarding into Super Admin Cockpit.`);
+    return { success: true };
   }
 
   /**

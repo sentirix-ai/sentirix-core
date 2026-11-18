@@ -205,8 +205,21 @@ export class AuthService implements OnModuleInit {
   }
 
   async register(dto: RegisterDto): Promise<AuthUserResponse> {
-    const lowerUsername = dto.username.toLowerCase().trim();
+    const rawUsername = dto.username.toLowerCase().trim();
+    const lowerUsername = rawUsername.replace(/[^a-z]/g, '');
     const lowerEmail = dto.email.toLowerCase().trim();
+
+    if (!/^[a-z]+$/.test(rawUsername)) {
+      throw new BadRequestException('Username must contain lowercase letters only (a-z). Numbers, spaces, and special symbols are strictly blocked.');
+    }
+
+    if (lowerUsername.length < 3) {
+      throw new BadRequestException('Username must be at least 3 letters long.');
+    }
+
+    if (lowerUsername.length > 20) {
+      throw new BadRequestException('Username cannot exceed 20 letters.');
+    }
 
     // Prevent overriding admin
     if (lowerUsername === 'pungkyrama') {

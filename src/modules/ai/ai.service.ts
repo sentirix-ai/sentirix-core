@@ -209,6 +209,156 @@ Return strictly JSON format:
   }
 
   /**
+   * Validate whether a renamed baseline service preserves the original functional domain
+   * or diverges into an entirely different business meaning using Gemini AI.
+   */
+  async validateServiceSemanticMatch(dto: {
+    originalService: string;
+    newServiceName: string;
+    industry?: string;
+  }): Promise<{
+    isCompatible: boolean;
+    confidenceScore: number;
+    explanation: string;
+    suggestAddAsNew: boolean;
+  }> {
+    const original = (dto.originalService || '').trim();
+    const candidate = (dto.newServiceName || '').trim();
+    const industry = (dto.industry || 'General Business').trim();
+
+    if (!original || !candidate) {
+      return {
+        isCompatible: false,
+        confidenceScore: 0,
+        explanation: 'Category name cannot be empty.',
+        suggestAddAsNew: false,
+      };
+    }
+
+    if (original.toLowerCase() === candidate.toLowerCase()) {
+      return {
+        isCompatible: true,
+        confidenceScore: 100,
+        explanation: 'The proposed name is identical to the baseline category.',
+        suggestAddAsNew: false,
+      };
+    }
+
+    if (this.aiClient) {
+      try {
+        const prompt = `You are the Chief AI Service Governance Architect for Sentirix B2B enterprise customer operations.
+A company in the "${industry}" sector is attempting to rename one of Sentirix's 6 core baseline complaint categories.
+
+Baseline Service Name: "${original}"
+Proposed New Service Name: "${candidate}"
+
+Task:
+Analyze whether the Proposed Name ("${candidate}") maintains the same core operational domain, customer complaint scope, or functional responsibility as the Baseline Service ("${original}") - such as corporate terminology, synonyms, or domain rephrasing.
+
+Evaluation Rules:
+1. "isCompatible: true": If the proposed name is a synonym, corporate phrasing, or reasonable variation of the SAME operational domain (e.g. "WISMO & Carrier Exceptions" renamed to "Linehaul Dispatch & Courier Route Tracking", or "Billing Invoices" renamed to "Accounts Receivable & Payment Disputes").
+2. "isCompatible: false": If the proposed name represents a FUNDAMENTALLY DIFFERENT operational domain or unrelated department (e.g. renaming a delivery/shipping service to "Corporate Tax & Legal Retainers", "Influencer Sponsorships", "Talent Acquisition", or "Property Damage Insurance").
+3. "explanation": Provide a polite, direct, executive-grade explanation in polished US English (e.g. "This baseline category is dedicated to ${industry} operations. The proposed name belongs to an unrelated department. To protect frontline response times and triage accuracy, we recommend adding this as a new category.").
+4. "suggestAddAsNew": true if rejected, recommending that the user keep the baseline and add their new topic as a custom category (+ Add Custom Ticket Category).
+
+Return strictly JSON format:
+{
+  "isCompatible": boolean,
+  "confidenceScore": number,
+  "explanation": "string",
+  "suggestAddAsNew": boolean
+}`;
+
+        const response = await this.aiClient.models.generateContent({
+          model: this.modelName,
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+          },
+        });
+
+        const parsed = JSON.parse(response.text || '{}');
+        return {
+          isCompatible: typeof parsed.isCompatible === 'boolean' ? parsed.isCompatible : true,
+          confidenceScore: typeof parsed.confidenceScore === 'number' ? parsed.confidenceScore : 85,
+          explanation: parsed.explanation || (parsed.isCompatible ? 'The proposed name aligns with the core functional scope of this baseline category.' : 'This proposed name diverges from the core operational scope of this baseline category.'),
+          suggestAddAsNew: !!parsed.suggestAddAsNew,
+        };
+      } catch (err) {
+        this.logger.warn(`AI semantic validation fallback applied: ${(err as Error).message}`);
+      }
+    }
+
+    return this.fallbackSemanticValidation(original, candidate, industry);
+  }
+
+  private fallbackSemanticValidation(
+    original: string,
+    candidate: string,
+    industry: string,
+  ): {
+    isCompatible: boolean;
+    confidenceScore: number;
+    explanation: string;
+    suggestAddAsNew: boolean;
+  } {
+    const origLower = original.toLowerCase();
+    const candLower = candidate.toLowerCase();
+
+    const clusters: Array<{ domain: string; keywords: string[] }> = [
+      {
+        domain: 'Shipping & Delivery Logistics',
+        keywords: [
+          'wismo', 'ship', 'carrier', 'delivery', 'transit', 'tracking', 'logistik', 'kurir', 'ekspedisi', 'paket', 'resi', 'antar', 'rts', 'fleet', 'depot'
+        ],
+      },
+      {
+        domain: 'Billing & Finance',
+        keywords: [
+          'billing', 'invoice', 'payment', 'charge', 'refund', 'tagihan', 'pembayaran', 'uang', 'transaksi', 'biaya', 'bayar', 'tarik', 'dispute', 'voucher', 'promo'
+        ],
+      },
+      {
+        domain: 'Technical Diagnostics & Engineering',
+        keywords: [
+          'bug', 'error', 'api', 'webhook', 'crash', 'down', 'sre', 'code', 'sistem', 'gangguan', 'teknis', 'kendala', 'server', 'database', 'access', 'login'
+        ],
+      },
+      {
+        domain: 'Clinical Healthcare & Telehealth',
+        keywords: [
+          'triage', 'doctor', 'telehealth', 'rx', 'prescription', 'clinic', 'ehr', 'hipaa', 'obat', 'dokter', 'pasien', 'klinik', 'resep', 'medis', 'darurat'
+        ],
+      },
+      {
+        domain: 'Corporate Tax, Legal, or Marketing',
+        keywords: [
+          'pajak', 'tax', 'irs', 'legal', 'hukum', 'influencer', 'endorse', 'marketing', 'iklan', 'hrd', 'rekrutmen', 'lowongan', 'kebakaran'
+        ],
+      },
+    ];
+
+    const origCluster = clusters.find((c) => c.keywords.some((kw) => origLower.includes(kw)));
+    const candCluster = clusters.find((c) => c.keywords.some((kw) => candLower.includes(kw)));
+
+    if (origCluster && candCluster && origCluster.domain !== candCluster.domain) {
+      return {
+        isCompatible: false,
+        confidenceScore: 90,
+        explanation: `This baseline category is dedicated to ${origCluster.domain}. The proposed name belongs to ${candCluster.domain}. To protect your frontline response times and triage accuracy, we recommend adding this as a new category.`,
+        suggestAddAsNew: true,
+      };
+    }
+
+    return {
+      isCompatible: true,
+      confidenceScore: 80,
+      explanation: 'The proposed name aligns with the core functional scope of this baseline category.',
+      suggestAddAsNew: false,
+    };
+  }
+
+  /**
    * 2. AI One-Click Reply Drafter (Intercom Fin-inspired)
    */
   async draftReply(dto: DraftReplyDto): Promise<DraftReplyResponseDto> {

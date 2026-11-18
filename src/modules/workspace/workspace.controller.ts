@@ -31,8 +31,11 @@ export class WorkspaceController {
    * Validate an invite link before showing the join form
    */
   @Get('validate-invite/:token')
-  async validateInvite(@Param('token') token: string) {
-    return this.workspaceService.validateInvite(token);
+  async validateInvite(
+    @Param('token') token: string,
+    @Query('sessionId') sessionId?: string,
+  ) {
+    return this.workspaceService.validateInvite(token, sessionId);
   }
 
   /**
@@ -205,11 +208,14 @@ export class WorkspaceController {
    * Get dynamic interconnected quota status for a Leader token
    */
   @Get('leader-token-status/:token')
-  async getLeaderTokenStatus(@Param('token') token: string) {
+  async getLeaderTokenStatus(
+    @Param('token') token: string,
+    @Query('sessionId') sessionId?: string,
+  ) {
     if (!token) {
       throw new BadRequestException('Token is required.');
     }
-    return this.workspaceService.getLeaderTokenQuotaStatus(token);
+    return this.workspaceService.getLeaderTokenQuotaStatus(token, sessionId);
   }
 
   /**
@@ -223,6 +229,7 @@ export class WorkspaceController {
       fullName: string;
       password?: string;
       chosenSubordinates: number;
+      sessionId?: string;
     },
   ) {
     return this.workspaceService.lockLeaderQuota(dto);
@@ -232,11 +239,14 @@ export class WorkspaceController {
    * Validate Agent Single-Use Token
    */
   @Get('agent-token-status/:token')
-  async getAgentTokenStatus(@Param('token') token: string) {
+  async getAgentTokenStatus(
+    @Param('token') token: string,
+    @Query('sessionId') sessionId?: string,
+  ) {
     if (!token) {
       throw new BadRequestException('Token is required.');
     }
-    return this.workspaceService.getAgentTokenStatus(token);
+    return this.workspaceService.getAgentTokenStatus(token, sessionId);
   }
 
   /**
@@ -249,6 +259,7 @@ export class WorkspaceController {
       token: string;
       fullName: string;
       password?: string;
+      sessionId?: string;
     },
   ) {
     return this.workspaceService.claimAgentToken(dto);
@@ -266,12 +277,43 @@ export class WorkspaceController {
   }
 
   /**
+   * Get Pending Leader Tokens for Resilient Step 4
+   */
+  @Get('pending-leader-tokens')
+  async getPendingLeaderTokens(@Query('identifier') identifier: string) {
+    if (!identifier) {
+      throw new BadRequestException('User identifier is required.');
+    }
+    return this.workspaceService.getPendingLeaderTokens(identifier);
+  }
+
+  /**
+   * Complete Onboarding
+   */
+  @Post('complete-onboarding')
+  async completeOnboarding(@Body() body: { identifier: string }) {
+    if (!body?.identifier) {
+      throw new BadRequestException('User identifier is required.');
+    }
+    return this.workspaceService.completeOnboarding(body.identifier);
+  }
+
+  /**
    * Regenerate Single-Use Token for Leader or Agent
    */
   @Post('regenerate-token')
-  async regenerateToken(@Body() body: { token?: string; identifier?: string }) {
-    if (body?.token && body.token.trim() !== '') {
-      return this.workspaceService.regenerateToken(body.token, body.identifier);
+  async regenerateToken(
+    @Body() body: { token?: string; identifier?: string; workspaceId?: string },
+  ) {
+    if (
+      (body?.token && body.token.trim() !== '') ||
+      (body?.workspaceId && body.workspaceId.trim() !== '')
+    ) {
+      return this.workspaceService.regenerateToken(
+        body.token,
+        body.identifier,
+        body.workspaceId,
+      );
     }
     if (body?.identifier && body.identifier.trim() !== '') {
       const ws = await this.workspaceService.getOrCreateUserWorkspace(body.identifier);

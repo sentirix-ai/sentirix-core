@@ -78,16 +78,18 @@ model Workspace {
 }
 
 model WorkspaceInviteToken {
-  id          String    @id @default(uuid())
-  workspaceId String
-  token       String    @unique
-  isUsed      Boolean   @default(false)
-  usedBy      String?
-  usedAt      DateTime?
-  createdAt   DateTime  @default(now())
-  expiresAt   DateTime?
-  role        String    @default("LEADER")
-  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  id              String    @id @default(uuid())
+  workspaceId     String
+  token           String    @unique
+  isUsed          Boolean   @default(false)
+  usedBy          String?
+  usedAt          DateTime?
+  openedBySession String?
+  openedAt        DateTime?
+  createdAt       DateTime  @default(now())
+  expiresAt       DateTime?
+  role            String    @default("LEADER")
+  workspace       Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
   @@index([token])
   @@index([workspaceId])

@@ -43,4 +43,19 @@ export class AiController {
   ) {
     return this.aiService.generatePodsForIndustry(industry, customDescription);
   }
+
+  @Post('validate-service-semantic')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Validate semantic meaning compatibility when renaming baseline services' })
+  async validateServiceSemantic(
+    @Body('originalService') originalService: string,
+    @Body('newServiceName') newServiceName: string,
+    @Body('industry') industry?: string,
+  ) {
+    return this.aiService.validateServiceSemanticMatch({
+      originalService,
+      newServiceName,
+      industry,
+    });
+  }
 }
