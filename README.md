@@ -126,6 +126,8 @@ CORS_ORIGIN="http://localhost:3000"
 npm install
 npx prisma generate
 npx prisma db push
+# Or apply database schema migrations:
+npx prisma migrate deploy
 ```
 
 ### 4. Run Development Server
