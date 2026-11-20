@@ -84,4 +84,8 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     this.server?.to(`ticket_${ticketId}`).emit('message:new', message);
     this.server?.emit('ticket:activity', { ticketId, message });
   }
+
+  broadcastUserForceLogout(payload: { userId: string; username?: string }) {
+    this.server?.emit('auth:force_logout', payload);
+  }
 }

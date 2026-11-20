@@ -219,6 +219,22 @@ export class WorkspaceController {
   }
 
   /**
+   * Interactive Quota Lock Toggle from Step 2 of Leader Activation
+   */
+  @Post('toggle-pod-quota-lock')
+  async togglePodQuotaLock(
+    @Body()
+    dto: {
+      token: string;
+      chosenSubordinates: number;
+      lock: boolean;
+      sessionId?: string;
+    },
+  ) {
+    return this.workspaceService.togglePodQuotaLock(dto);
+  }
+
+  /**
    * Lock Leader Quota (Click Checkmark [✓]) & Auto-Generate Single-Use Agent Tokens
    */
   @Post('lock-leader-quota')
@@ -299,6 +315,41 @@ export class WorkspaceController {
   }
 
   /**
+   * Save Onboarding In-Progress Draft (Step 1, 2, 3 autosave)
+   */
+  @Post('onboarding-draft')
+  async saveOnboardingDraft(@Body() body: { identifier: string; draft: any }) {
+    if (!body?.identifier) {
+      throw new BadRequestException('User identifier is required.');
+    }
+    return this.workspaceService.saveOnboardingDraft(body.identifier, body.draft);
+  }
+
+  /**
+   * Get Onboarding In-Progress Draft
+   */
+  @Get('onboarding-draft')
+  async getOnboardingDraft(@Query('identifier') identifier: string) {
+    if (!identifier) {
+      throw new BadRequestException('User identifier is required.');
+    }
+    const draft = this.workspaceService.getOnboardingDraft(identifier);
+    return { success: true, draft };
+  }
+
+  /**
+   * Delete Onboarding In-Progress Draft
+   */
+  @Delete('onboarding-draft')
+  async deleteOnboardingDraft(@Query('identifier') identifier: string) {
+    if (!identifier) {
+      throw new BadRequestException('User identifier is required.');
+    }
+    this.workspaceService.deleteOnboardingDraft(identifier);
+    return { success: true };
+  }
+
+  /**
    * Regenerate Single-Use Token for Leader or Agent
    */
   @Post('regenerate-token')
@@ -325,6 +376,27 @@ export class WorkspaceController {
       };
     }
     throw new BadRequestException('Either token or identifier is required.');
+  }
+
+  /**
+   * Super Admin Sovereign Session Revocation (Force Logout)
+   */
+  @Post('force-logout')
+  async forceLogout(
+    @Body()
+    body: {
+      userId?: string;
+      username?: string;
+      token?: string;
+      requesterIdentifier?: string;
+    },
+  ) {
+    return this.workspaceService.forceLogoutUser(
+      body?.userId,
+      body?.username,
+      body?.token,
+      body?.requesterIdentifier,
+    );
   }
 
   /**

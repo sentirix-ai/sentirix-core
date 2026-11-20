@@ -11,13 +11,16 @@ import {
 
 export class RegisterDto {
   @ApiProperty({
-    example: 'sarah_ops#',
-    description: 'Username max 20 chars, special characters allowed, strictly no spaces',
+    example: 'sarah_ops99',
+    description: 'Username 3-20 characters: letters, numbers, dots, underscores. Strictly no spaces.',
   })
   @IsString()
   @IsNotEmpty()
+  @MinLength(3, { message: 'Username must be at least 3 characters long.' })
   @MaxLength(20, { message: 'Username must not exceed 20 characters.' })
-  @Matches(/^[^\s]+$/, { message: 'Username must not contain any spaces.' })
+  @Matches(/^[a-z0-9][a-z0-9._]*$/i, {
+    message: 'Username must start with a letter or number and contain only letters, numbers, dots, and underscores.',
+  })
   username: string;
 
   @ApiProperty({ example: 'sarah.jenkins@company.com' })

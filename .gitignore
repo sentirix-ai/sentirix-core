@@ -23,6 +23,10 @@ pnpm-debug.log*
 # Testing coverage
 /coverage
 
+# Local runtime data & debug scripts
+/data/
+*.mjs
+
 # OS & Editor
 .DS_Store
 Thumbs.db

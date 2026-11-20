@@ -6,6 +6,8 @@ import {
   Logger,
 } from '@nestjs/common';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { EventsGateway } from '../events/events.gateway.js';
 import { JoinWorkspaceDto } from './dto/join-workspace.dto.js';
@@ -855,15 +857,22 @@ export class WorkspaceService {
   /**
    * Check if a member session is still active
    */
-  async checkMemberStatus(userId: string) {
-    if (!userId) return { active: false };
+  async checkMemberStatus(identifier: string) {
+    if (!identifier || identifier.trim() === '') return { active: false };
     try {
-      const user = await this.prisma.user.findUnique({
-        where: { id: userId },
+      const cleanId = identifier.trim();
+      const user = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { id: cleanId },
+            { username: { equals: cleanId, mode: 'insensitive' } },
+            { email: { equals: cleanId, mode: 'insensitive' } },
+          ],
+        },
       });
       return { active: !!user };
     } catch {
-      return { active: true };
+      return { active: false };
     }
   }
 
@@ -1576,21 +1585,68 @@ export class WorkspaceService {
       (p) => !p.isQuotaLocked && p.id !== currentWorkspace.id,
     ).length;
 
-    // Interconnected quota formula:
-    // M_k^max = min(7, max(1, totalSeats - lockedSeats - 1 - otherUnlockedPodsCount))
-    const calculatedMax = totalSeats - lockedSeats - 1 - otherUnlockedPodsCount;
-    const maxSubordinatesAllowed = Math.min(7, Math.max(1, calculatedMax));
-
-    // Determine if this is the last pod to lock quota (other pod(s) have already locked quota and no other unlocked pods remain)
+    // Determine if this is the last pod to lock quota
     const isLastPod = otherUnlockedPodsCount === 0 && otherLockedPods.length > 0;
 
-    // If it is the last pod, ONLY leave the single exact maximum quota (no options below 1..5, no options above 7..)!
-    const allowedOptions = isLastPod
-      ? [maxSubordinatesAllowed]
-      : Array.from(
-          { length: maxSubordinatesAllowed },
-          (_, i) => i + 1,
-        );
+    let maxSubordinatesAllowed: number;
+    let allowedOptions: number[];
+
+    if (currentWorkspace.isQuotaLocked) {
+      // This pod is already locked
+      const currentSubordinates = Math.max(1, currentWorkspace.assignedQuota - 1);
+      maxSubordinatesAllowed = currentSubordinates;
+      allowedOptions = [currentSubordinates];
+    } else if (isLastPod) {
+      // Final pod to lock quota: receives the exact remainder of the organization seats
+      // Hard cap: maximum 8 seats (1 Leader + 7 Agents)
+      // Hard floor: minimum 2 seats (1 Leader + 1 Agent)
+      const remainingOrgSeats = totalSeats - lockedSeats;
+      const exactSeats = Math.min(8, Math.max(2, remainingOrgSeats));
+      const exactSubordinates = exactSeats - 1;
+      maxSubordinatesAllowed = exactSubordinates;
+      // Dropdown contains only the exact remaining seats
+      allowedOptions = [exactSubordinates];
+    } else {
+      // Not the last pod: reserve at least 2 seats (1 leader + 1 member) for every other unlocked pod
+      const reservedSeatsForOthers = otherUnlockedPodsCount * 2;
+      const availableSeatsForThisPod = totalSeats - lockedSeats - reservedSeatsForOthers;
+      // Hard cap: maximum 8 seats (1 Leader + 7 Agents)
+      // Hard floor: minimum 2 seats (1 Leader + 1 Agent)
+      const maxAllowedSeats = Math.min(8, Math.max(2, availableSeatsForThisPod));
+      const maxSubs = maxAllowedSeats - 1;
+      maxSubordinatesAllowed = maxSubs;
+      allowedOptions = Array.from(
+        { length: maxSubordinatesAllowed },
+        (_, i) => i + 1,
+      );
+    }
+
+    // If pod is quota locked, fetch its agent tokens so frontend can restore activation view on refresh
+    let agentTokensList: Array<{
+      token: string;
+      joinUrl: string;
+      isUsed: boolean;
+      usedBy: string | null;
+      isOpened: boolean;
+    }> = [];
+    if (currentWorkspace.isQuotaLocked) {
+      try {
+        const agts = await this.prisma.workspaceInviteToken.findMany({
+          where: { workspaceId: currentWorkspace.id, role: 'AGENT' },
+          select: { token: true, isUsed: true, usedBy: true, openedBySession: true },
+          orderBy: { createdAt: 'asc' },
+        });
+        agentTokensList = agts.map((a) => ({
+          token: a.token,
+          joinUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/join?token=${a.token}`,
+          isUsed: !!a.isUsed,
+          usedBy: a.usedBy || null,
+          isOpened: !!a.openedBySession,
+        }));
+      } catch (err) {
+        this.logger.warn(`Could not load agent tokens for locked pod: ${(err as Error)?.message}`);
+      }
+    }
 
     return {
       valid: true,
@@ -1598,6 +1654,15 @@ export class WorkspaceService {
       role: 'LEADER',
       isExistingLeader,
       existingLeaderName,
+      leaderUser: activeLeaderMember?.user
+        ? {
+            id: activeLeaderMember.user.id,
+            username: activeLeaderMember.user.username,
+            fullName: activeLeaderMember.user.fullName,
+            email: activeLeaderMember.user.email,
+          }
+        : null,
+      agentTokens: agentTokensList,
       workspace: {
         id: currentWorkspace.id,
         name: currentWorkspace.name,
@@ -1622,6 +1687,125 @@ export class WorkspaceService {
         allowedOptions,
       },
     };
+  }
+
+  /**
+   * Interactive Quota Lock Toggle from Step 2 of Leader Activation
+   * Persists isQuotaLocked immediately to PostgreSQL so neighboring pods reflect the remaining seats dynamically.
+   */
+  async togglePodQuotaLock(dto: {
+    token: string;
+    chosenSubordinates: number;
+    lock: boolean;
+    sessionId?: string;
+  }) {
+    const { token, chosenSubordinates, lock, sessionId } = dto;
+    if (!token) {
+      throw new BadRequestException('Token is required.');
+    }
+    const cleanToken = token.trim();
+
+    const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
+      where: { token: cleanToken },
+      include: {
+        workspace: {
+          include: { organization: true },
+        },
+      },
+    });
+
+    if (!tokenRecord || !tokenRecord.workspace) {
+      throw new BadRequestException('Invalid or expired token.');
+    }
+
+    const workspace = tokenRecord.workspace;
+    const organization = workspace.organization;
+    if (!organization) {
+      throw new BadRequestException('Organization record not found for this pod token.');
+    }
+
+    if (lock) {
+      const allPods = await this.prisma.workspace.findMany({
+        where: { organizationId: organization.id },
+      });
+      const otherLockedPods = allPods.filter(
+        (p) => p.isQuotaLocked && p.id !== workspace.id,
+      );
+      const lockedSeats = otherLockedPods.reduce(
+        (sum, p) => sum + p.assignedQuota,
+        0,
+      );
+      const otherUnlockedPodsCount = allPods.filter(
+        (p) => !p.isQuotaLocked && p.id !== workspace.id,
+      ).length;
+
+      const isLastPod = otherUnlockedPodsCount === 0 && otherLockedPods.length > 0;
+      let safeSubordinates: number;
+
+      if (isLastPod) {
+        const remainingSeats = (organization.totalSeats || 20) - lockedSeats;
+        const exactSeats = Math.min(8, Math.max(2, remainingSeats));
+        safeSubordinates = exactSeats - 1;
+      } else {
+        const reservedForOthers = otherUnlockedPodsCount * 2;
+        const availableSeats = (organization.totalSeats || 20) - lockedSeats - reservedForOthers;
+        const maxAllowedSeats = Math.min(8, Math.max(2, availableSeats));
+        const maxSubs = maxAllowedSeats - 1;
+        safeSubordinates = Math.min(Math.max(1, Number(chosenSubordinates) || 1), maxSubs);
+      }
+
+      const totalPodQuota = 1 + safeSubordinates;
+      await this.prisma.workspace.update({
+        where: { id: workspace.id },
+        data: {
+          assignedQuota: totalPodQuota,
+          maxMembers: totalPodQuota,
+          isQuotaLocked: true,
+          lockedAt: new Date(),
+        },
+      });
+
+      // If exactly 1 other unlocked pod remains, update its assignedQuota to the exact remainder
+      if (otherUnlockedPodsCount === 1) {
+        const remainingUnlocked = allPods.filter(
+          (p) => !p.isQuotaLocked && p.id !== workspace.id,
+        );
+        if (remainingUnlocked.length === 1) {
+          const remainderSeats = Math.min(
+            8,
+            Math.max(
+              2,
+              (organization.totalSeats || 20) - lockedSeats - totalPodQuota,
+            ),
+          );
+          await this.prisma.workspace.update({
+            where: { id: remainingUnlocked[0].id },
+            data: {
+              assignedQuota: remainderSeats,
+              maxMembers: remainderSeats,
+            },
+          });
+        }
+      }
+
+      this.logger.log(
+        `Pod "${workspace.name}" quota LOCKED at ${totalPodQuota} seats (${safeSubordinates} subordinates + 1 leader).`,
+      );
+    } else {
+      // Unlock quota
+      await this.prisma.workspace.update({
+        where: { id: workspace.id },
+        data: {
+          isQuotaLocked: false,
+          lockedAt: null,
+        },
+      });
+
+      this.logger.log(`Pod "${workspace.name}" quota UNLOCKED.`);
+    }
+
+    // Return the updated leader token quota status
+    return this.getLeaderTokenQuotaStatus(cleanToken, sessionId);
   }
 
   /**
@@ -1850,19 +2034,17 @@ export class WorkspaceService {
             quotaStatus.organization?.totalSeats ||
             quotaStatus.quotaStats.totalSeats ||
             20;
-          const remainder = Math.max(1, orgTotal - currentLockedSum);
+          const remainder = Math.min(8, Math.max(2, orgTotal - currentLockedSum));
 
           await this.prisma.workspace.update({
             where: { id: otherPod.id },
             data: {
               assignedQuota: remainder,
               maxMembers: remainder,
-              isQuotaLocked: true,
-              lockedAt: new Date(),
             },
           });
           this.logger.log(
-            `Auto-locked neighboring Pod "${otherPod.name}" with remaining quota: ${remainder} seats.`,
+            `Updated neighboring Pod "${otherPod.name}" with remaining quota: ${remainder} seats.`,
           );
         }
       } catch (autoLockErr) {
@@ -1925,6 +2107,9 @@ export class WorkspaceService {
       agentTokens.push({
         token: agt.token,
         joinUrl: `http://localhost:3000/join?token=${agt.token}`,
+        isUsed: false,
+        usedBy: null,
+        isOpened: false,
       });
     }
 
@@ -1997,7 +2182,7 @@ export class WorkspaceService {
     if (!tokenRecord) {
       return {
         valid: false,
-        error: 'Invalid or unknown agent invitation token.',
+        error: 'This invitation token is invalid or has been regenerated by your Pod Leader. Please use the latest active invitation link from your Leader.',
       };
     }
 
@@ -2008,19 +2193,18 @@ export class WorkspaceService {
       };
     }
 
-    const isReturningAgent = !!tokenRecord.usedBy;
-
-    if (tokenRecord.isUsed && !isReturningAgent) {
+    // Strict Single-Use Token Check: If already used, permanently locked
+    if (tokenRecord.isUsed) {
       return {
         valid: false,
         isUsed: true,
-        error: `This agent token has already been claimed by ${tokenRecord.usedBy || 'another team member'} on ${tokenRecord.usedAt ? new Date(tokenRecord.usedAt).toLocaleString() : 'earlier'}. Each token can only be claimed once.`,
+        error: `This single-use invitation token has already been claimed by ${tokenRecord.usedBy || 'a team member'} and is permanently locked. Each token can only be used once.`,
         workspaceName: tokenRecord.workspace?.name,
       };
     }
 
     // First-Open Browser Session Lock: Disallow simultaneous opening in a second browser (PostgreSQL Persisted)
-    if (tokenRecord.openedBySession && !isReturningAgent) {
+    if (tokenRecord.openedBySession) {
       const isExpired =
         tokenRecord.openedAt &&
         Date.now() - new Date(tokenRecord.openedAt).getTime() > 30 * 60 * 1000;
@@ -2029,11 +2213,11 @@ export class WorkspaceService {
           valid: false,
           isLockedToOtherSession: true,
           error:
-            'This single-use invitation link is currently active in another browser session. To protect organization security, simultaneous or duplicate access is prohibited. Please request a fresh invitation link from your Super Admin.',
+            'This single-use invitation link is currently active in another browser session. To protect organization security, simultaneous or duplicate access is prohibited. Please request a fresh invitation link from your Leader.',
           workspaceName: tokenRecord.workspace?.name,
         };
       }
-    } else if (sessionId && !isReturningAgent && !tokenRecord.openedBySession) {
+    } else if (sessionId && !tokenRecord.openedBySession) {
       await this.prisma.workspaceInviteToken.update({
         where: { id: tokenRecord.id },
         data: {
@@ -2044,6 +2228,12 @@ export class WorkspaceService {
       this.logger.log(
         `[TokenLock] Agent token "${cleanToken}" bound to first-open browser session "${sessionId}" in PostgreSQL.`,
       );
+      try {
+        this.eventsGateway.server?.emit('agent:token-opened', {
+          workspaceId: tokenRecord.workspaceId,
+          token: cleanToken,
+        });
+      } catch {}
     }
 
     const leaderMember =
@@ -2119,6 +2309,12 @@ export class WorkspaceService {
 
     if (!tokenRecord) {
       throw new NotFoundException('Token not found.');
+    }
+
+    if (tokenRecord.isUsed) {
+      throw new BadRequestException(
+        `This invitation token has already been claimed by ${tokenRecord.usedBy || 'another member'} and is permanently locked.`,
+      );
     }
 
     const workspace = tokenRecord.workspace;
@@ -2239,6 +2435,11 @@ export class WorkspaceService {
           fullName: agentUser.fullName,
           role: 'AGENT',
         },
+      });
+      this.eventsGateway.server?.emit('agent:claimed-token', {
+        workspaceId: workspace.id,
+        token: cleanToken,
+        usedBy: agentUser.fullName,
       });
     } catch {
       // ignore
@@ -2713,9 +2914,12 @@ export class WorkspaceService {
           rawIsUsed: false,
           needsRegeneration: false,
           usedBy: null,
+          userId: null,
+          username: null,
           isUserOnline: false,
           userStatus: 'UNCLAIMED',
           hadManualLogout: false,
+          hadForceLogout: false,
         };
       }
 
@@ -2725,13 +2929,18 @@ export class WorkspaceService {
           p.username?.toLowerCase() === effectiveUsedBy.toLowerCase(),
       );
 
+      const hadForceLogout =
+        !matched?.isOnline &&
+        matched?.sessionHistory?.[0]?.logoutReason === 'ADMIN_FORCE_LOGOUT';
+
       const hadManual =
         !matched?.isOnline &&
+        !hadForceLogout &&
         (matched?.status === 'LOGOUT' ||
           matched?.sessionHistory?.[0]?.logoutReason === 'MANUAL_LOGOUT');
 
       const hadCloseBrowser =
-        !matched?.isOnline && !hadManual;
+        !matched?.isOnline && !hadManual && !hadForceLogout;
 
       // Look up workspace member record to get authoritative joinedAt if available
       const memberRecord = parentWorkspace?.members?.find(
@@ -2752,16 +2961,21 @@ export class WorkspaceService {
         needsRegeneration,
         usedBy: effectiveUsedBy,
         usedAt: effectiveUsedAt,
+        userId: matched ? matched.userId : null,
+        username: matched ? matched.username : null,
         isUserOnline: matched ? matched.isOnline : false,
         userStatus: matched
           ? matched.isOnline
             ? 'ONLINE'
-            : hadManual
-              ? 'LOGOUT'
-              : 'LOGOUT_CLOSE_BROWSER'
+            : hadForceLogout
+              ? 'LOGOUT_FORCE'
+              : hadManual
+                ? 'LOGOUT'
+                : 'LOGOUT_CLOSE_BROWSER'
           : 'LOGOUT_CLOSE_BROWSER',
         hadManualLogout: hadManual,
         hadCloseBrowser: hadCloseBrowser,
+        hadForceLogout: hadForceLogout,
       };
     });
 
@@ -3117,8 +3331,99 @@ export class WorkspaceService {
       },
     });
 
+    this.deleteOnboardingDraft(cleanId);
+    if (user.username) this.deleteOnboardingDraft(user.username);
+    if (user.email) this.deleteOnboardingDraft(user.email);
+
     this.logger.log(`User @${user.username} officially completed onboarding into Super Admin Cockpit.`);
     return { success: true };
+  }
+
+  /**
+   * Onboarding Draft Persistence (Step 1, 2, 3 autosave across logins)
+   */
+  private readonly draftFilePath = path.join(process.cwd(), 'data', 'onboarding-drafts.json');
+
+  private loadDraftsFromFile(): Record<string, any> {
+    try {
+      if (!fs.existsSync(this.draftFilePath)) {
+        const dir = path.dirname(this.draftFilePath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(this.draftFilePath, JSON.stringify({}), 'utf-8');
+        return {};
+      }
+      const raw = fs.readFileSync(this.draftFilePath, 'utf-8');
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+
+  private saveDraftsToFile(drafts: Record<string, any>) {
+    try {
+      const dir = path.dirname(this.draftFilePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(this.draftFilePath, JSON.stringify(drafts, null, 2), 'utf-8');
+    } catch (e) {
+      this.logger.error(`Failed to save onboarding drafts: ${(e as Error).message}`);
+    }
+  }
+
+  saveOnboardingDraft(identifier: string, draftData: any) {
+    if (!identifier || identifier.trim() === '') {
+      return { success: false, error: 'Identifier is required.' };
+    }
+    const cleanId = identifier.trim().toLowerCase();
+    const drafts = this.loadDraftsFromFile();
+    const payload = {
+      ...draftData,
+      updatedAt: new Date().toISOString(),
+    };
+
+    drafts[cleanId] = payload;
+    if (draftData.username && typeof draftData.username === 'string') {
+      drafts[draftData.username.trim().toLowerCase()] = payload;
+    }
+    if (draftData.email && typeof draftData.email === 'string') {
+      drafts[draftData.email.trim().toLowerCase()] = payload;
+    }
+    if (draftData.userId && typeof draftData.userId === 'string') {
+      drafts[draftData.userId.trim().toLowerCase()] = payload;
+    }
+
+    this.saveDraftsToFile(drafts);
+    return { success: true, draft: drafts[cleanId] };
+  }
+
+  getOnboardingDraft(identifier: string) {
+    if (!identifier || identifier.trim() === '') return null;
+    const cleanId = identifier.trim().toLowerCase();
+    const drafts = this.loadDraftsFromFile();
+    return drafts[cleanId] || null;
+  }
+
+  deleteOnboardingDraft(identifier: string) {
+    if (!identifier || identifier.trim() === '') return;
+    const cleanId = identifier.trim().toLowerCase();
+    const drafts = this.loadDraftsFromFile();
+    let changed = false;
+    if (drafts[cleanId]) {
+      const existing = drafts[cleanId];
+      delete drafts[cleanId];
+      changed = true;
+      if (existing?.username && drafts[existing.username.trim().toLowerCase()]) {
+        delete drafts[existing.username.trim().toLowerCase()];
+      }
+      if (existing?.email && drafts[existing.email.trim().toLowerCase()]) {
+        delete drafts[existing.email.trim().toLowerCase()];
+      }
+      if (existing?.userId && drafts[existing.userId.trim().toLowerCase()]) {
+        delete drafts[existing.userId.trim().toLowerCase()];
+      }
+    }
+    if (changed) {
+      this.saveDraftsToFile(drafts);
+    }
   }
 
   /**
@@ -3786,6 +4091,129 @@ export class WorkspaceService {
         isQuotaLocked: updatedWorkspace.isQuotaLocked,
       },
       newTokens: generatedTokens,
+    };
+  }
+
+  /**
+   * Super Admin Sovereign Session Revocation (Force Logout)
+   * Immediately terminates active session for a leader or agent across all pods,
+   * invalidates single-use credentials, and broadcasts termination signal.
+   */
+  async forceLogoutUser(
+    userId?: string,
+    username?: string,
+    token?: string,
+    requesterIdentifier?: string,
+  ) {
+    if (requesterIdentifier && requesterIdentifier.trim() !== '') {
+      const requester = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { id: requesterIdentifier },
+            { username: { equals: requesterIdentifier, mode: 'insensitive' } },
+            { email: { equals: requesterIdentifier, mode: 'insensitive' } },
+          ],
+        },
+      });
+      const isSuperAdmin =
+        requester?.role === 'ADMIN' ||
+        requester?.username?.toLowerCase() === 'pungkyrama';
+      if (!isSuperAdmin) {
+        throw new ForbiddenException(
+          'Access denied. Only Super Admin has sovereign authority to force logout personnel.',
+        );
+      }
+    }
+
+    let targetUser: any = null;
+    if (userId && userId.trim() !== '') {
+      targetUser = await this.prisma.user.findUnique({
+        where: { id: userId.trim() },
+      });
+    }
+
+    if (!targetUser && username && username.trim() !== '') {
+      targetUser = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { username: { equals: username.trim(), mode: 'insensitive' } },
+            { fullName: { equals: username.trim(), mode: 'insensitive' } },
+          ],
+        },
+      });
+    }
+
+    if (!targetUser && token && token.trim() !== '') {
+      const tokRec = await this.prisma.workspaceInviteToken.findUnique({
+        where: { token: token.trim() },
+      });
+      if (tokRec?.usedBy) {
+        targetUser = await this.prisma.user.findFirst({
+          where: {
+            OR: [
+              { username: { equals: tokRec.usedBy.trim(), mode: 'insensitive' } },
+              { fullName: { equals: tokRec.usedBy.trim(), mode: 'insensitive' } },
+            ],
+          },
+        });
+      }
+    }
+
+    if (!targetUser) {
+      throw new NotFoundException('Target personnel account not found to force logout.');
+    }
+
+    if (targetUser.role === 'ADMIN' || targetUser.username?.toLowerCase() === 'pungkyrama') {
+      throw new BadRequestException('Cannot force logout Super Administrator.');
+    }
+
+    // Terminate all active sessions for this user
+    await this.prisma.userActivitySession.updateMany({
+      where: { userId: targetUser.id, isOnline: true },
+      data: {
+        isOnline: false,
+        logoutAt: new Date(),
+        logoutReason: 'ADMIN_FORCE_LOGOUT',
+      },
+    });
+
+    // Mark the invite token as used so needsRegeneration becomes true
+    if (token && token.trim() !== '') {
+      await this.prisma.workspaceInviteToken.updateMany({
+        where: { token: token.trim() },
+        data: { isUsed: true },
+      });
+    } else {
+      await this.prisma.workspaceInviteToken.updateMany({
+        where: {
+          OR: [
+            { usedBy: targetUser.fullName },
+            { usedBy: targetUser.username },
+          ],
+        },
+        data: { isUsed: true },
+      });
+    }
+
+    // Broadcast instant WebSocket termination signal
+    try {
+      this.eventsGateway.broadcastUserForceLogout({
+        userId: targetUser.id,
+        username: targetUser.username,
+      });
+    } catch (e) {
+      this.logger.warn(`Failed to broadcast force logout socket: ${(e as Error).message}`);
+    }
+
+    this.logger.log(
+      `Super Admin forced logout on user: ${targetUser.fullName || targetUser.username} (${targetUser.id})`,
+    );
+
+    return {
+      success: true,
+      message: `User ${targetUser.fullName || targetUser.username} has been forcefully logged out.`,
+      userId: targetUser.id,
+      username: targetUser.username,
     };
   }
 }

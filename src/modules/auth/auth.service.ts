@@ -6,6 +6,8 @@ import {
   Logger,
 } from '@nestjs/common';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { RegisterDto } from './dto/register.dto.js';
 import { LoginDto } from './dto/login.dto.js';
@@ -28,6 +30,7 @@ export interface AuthUserResponse {
   avatarUrl?: string | null;
   token?: string;
   onboardingCompleted?: boolean;
+  onboardingDraft?: any;
 }
 
 interface StoredMemoryUser {
@@ -102,8 +105,14 @@ export class AuthService implements OnModuleInit {
    */
   async startSession(userId: string, role?: string, workspaceId?: string) {
     try {
-      const user = await this.prisma.user.findUnique({
-        where: { id: userId },
+      const user = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { id: userId },
+            { username: { equals: userId, mode: 'insensitive' } },
+            { email: { equals: userId, mode: 'insensitive' } },
+          ],
+        },
         include: { workspaceMembership: true },
       });
       if (!user) return null;
@@ -111,7 +120,7 @@ export class AuthService implements OnModuleInit {
       // Close all previous active sessions for this user so they don't produce duplicate ghost online sessions
       await this.prisma.userActivitySession.updateMany({
         where: {
-          userId,
+          userId: user.id,
           isOnline: true,
         },
         data: {
@@ -133,7 +142,7 @@ export class AuthService implements OnModuleInit {
 
       const session = await this.prisma.userActivitySession.create({
         data: {
-          userId,
+          userId: user.id,
           organizationId: user.organizationId,
           workspaceId: effectiveWorkspaceId,
           role: effectiveRole,
@@ -154,8 +163,22 @@ export class AuthService implements OnModuleInit {
    */
   async heartbeat(userId: string) {
     try {
+      const user = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { id: userId },
+            { username: { equals: userId, mode: 'insensitive' } },
+            { email: { equals: userId, mode: 'insensitive' } },
+          ],
+        },
+      });
+
+      if (!user) {
+        return { success: false, active: false, reason: 'USER_NOT_FOUND' };
+      }
+
       const activeSession = await this.prisma.userActivitySession.findFirst({
-        where: { userId, isOnline: true },
+        where: { userId: user.id, isOnline: true },
         orderBy: { loginAt: 'desc' },
       });
 
@@ -164,13 +187,32 @@ export class AuthService implements OnModuleInit {
           where: { id: activeSession.id },
           data: { lastHeartbeatAt: new Date() },
         });
-        return { success: true, sessionId: activeSession.id };
+        return { success: true, active: true, sessionId: activeSession.id };
       } else {
-        const newSession = await this.startSession(userId);
-        return { success: true, sessionId: newSession?.id };
+        const latestSession = await this.prisma.userActivitySession.findFirst({
+          where: { userId: user.id },
+          orderBy: { loginAt: 'desc' },
+        });
+
+        if (
+          latestSession &&
+          !latestSession.isOnline &&
+          (latestSession.logoutReason === 'ADMIN_FORCE_LOGOUT' ||
+            latestSession.logoutReason === 'MANUAL_LOGOUT' ||
+            latestSession.logoutReason === 'BROWSER_CLOSED')
+        ) {
+          return {
+            success: false,
+            active: false,
+            reason: latestSession.logoutReason,
+          };
+        }
+
+        const newSession = await this.startSession(user.id);
+        return { success: true, active: true, sessionId: newSession?.id };
       }
     } catch (e) {
-      return { success: false, error: (e as Error).message };
+      return { success: false, active: false, error: (e as Error).message };
     }
   }
 
@@ -204,21 +246,71 @@ export class AuthService implements OnModuleInit {
     return Buffer.from(payload).toString('base64');
   }
 
+  // Retrieve persistent onboarding draft for any associated identifier
+  private getOnboardingDraftForUser(identifiers: (string | undefined | null)[]): any {
+    try {
+      const draftPath = path.join(process.cwd(), 'data', 'onboarding-drafts.json');
+      if (!fs.existsSync(draftPath)) return null;
+      const raw = fs.readFileSync(draftPath, 'utf-8');
+      const drafts = JSON.parse(raw);
+      for (const id of identifiers) {
+        if (id) {
+          const key = id.toLowerCase().trim();
+          if (drafts[key]) {
+            return drafts[key];
+          }
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Delete onboarding draft from file for any associated identifier (guarantees clean slate on new registration)
+  private deleteOnboardingDraftForUser(identifiers: (string | undefined | null)[]): void {
+    try {
+      const draftPath = path.join(process.cwd(), 'data', 'onboarding-drafts.json');
+      if (!fs.existsSync(draftPath)) return;
+      const raw = fs.readFileSync(draftPath, 'utf-8');
+      const drafts = JSON.parse(raw);
+      let changed = false;
+      for (const id of identifiers) {
+        if (id) {
+          const key = id.toLowerCase().trim();
+          if (drafts[key]) {
+            delete drafts[key];
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        fs.writeFileSync(draftPath, JSON.stringify(drafts, null, 2), 'utf-8');
+      }
+    } catch {}
+  }
+
   async register(dto: RegisterDto): Promise<AuthUserResponse> {
     const rawUsername = dto.username.toLowerCase().trim();
-    const lowerUsername = rawUsername.replace(/[^a-z]/g, '');
+    const lowerUsername = rawUsername.replace(/[^a-z0-9._]/g, '');
     const lowerEmail = dto.email.toLowerCase().trim();
 
-    if (!/^[a-z]+$/.test(rawUsername)) {
-      throw new BadRequestException('Username must contain lowercase letters only (a-z). Numbers, spaces, and special symbols are strictly blocked.');
-    }
-
     if (lowerUsername.length < 3) {
-      throw new BadRequestException('Username must be at least 3 letters long.');
+      throw new BadRequestException('Username must be at least 3 characters long.');
     }
 
     if (lowerUsername.length > 20) {
-      throw new BadRequestException('Username cannot exceed 20 letters.');
+      throw new BadRequestException('Username cannot exceed 20 characters.');
+    }
+
+    if (!/^[a-z0-9]/.test(lowerUsername)) {
+      throw new BadRequestException('Username must start with a letter or number.');
+    }
+
+    if (!/^[a-z0-9._]+$/.test(lowerUsername)) {
+      throw new BadRequestException(
+        'Username can only contain lowercase letters (a-z), numbers (0-9), dots (.), and underscores (_).',
+      );
     }
 
     // Prevent overriding admin
@@ -261,6 +353,8 @@ export class AuthService implements OnModuleInit {
       });
 
       this.logger.log(`User @${lowerUsername} registered successfully in PostgreSQL db_sentirix.`);
+      // Ensure clean slate by wiping any stale draft files for this username/email
+      this.deleteOnboardingDraftForUser([lowerUsername, lowerEmail]);
 
       return {
         id: dbUser.id,
@@ -388,6 +482,13 @@ export class AuthService implements OnModuleInit {
         const wsRole = dbUser.workspaceMembership?.role;
         const isLeader = wsRole === 'LEADER';
 
+        const draft = this.getOnboardingDraftForUser([
+          dbUser.username,
+          dbUser.email,
+          dbUser.id,
+          lowerId,
+        ]);
+
         return {
           id: dbUser.id,
           username: dbUser.username || dbUser.fullName,
@@ -405,6 +506,7 @@ export class AuthService implements OnModuleInit {
           avatarUrl: dbUser.avatarUrl || undefined,
           token: this.generateToken(dbUser.id, dbUser.role),
           onboardingCompleted: dbUser.onboardingCompleted ?? false,
+          onboardingDraft: draft || null,
         };
       }
     } catch (err) {
@@ -427,6 +529,13 @@ export class AuthService implements OnModuleInit {
       throw new UnauthorizedException('Incorrect password. Please verify and try again.');
     }
 
+    const memoryDraft = this.getOnboardingDraftForUser([
+      memoryUser.username,
+      memoryUser.email,
+      memoryUser.id,
+      lowerId,
+    ]);
+
     return {
       id: memoryUser.id,
       username: memoryUser.username,
@@ -439,6 +548,7 @@ export class AuthService implements OnModuleInit {
       avatarUrl: memoryUser.avatarUrl || undefined,
       token: this.generateToken(memoryUser.id, memoryUser.role),
       onboardingCompleted: memoryUser.onboardingCompleted ?? false,
+      onboardingDraft: memoryDraft || null,
     };
   }
 
