@@ -1523,17 +1523,17 @@ export class WorkspaceService {
       tokenRecord.usedBy ||
       null;
 
-    if (tokenRecord.isUsed && !isExistingLeader) {
+    if (tokenRecord.isUsed) {
       return {
         valid: false,
         isUsed: true,
-        error: `This leader activation token has already been claimed by ${tokenRecord.usedBy || 'another user'} on ${tokenRecord.usedAt ? new Date(tokenRecord.usedAt).toLocaleString() : 'earlier'}. Each token can only be claimed once.`,
+        error: `This leader activation token has already been claimed by ${tokenRecord.usedBy || 'another user'} on ${tokenRecord.usedAt ? new Date(tokenRecord.usedAt).toLocaleString() : 'earlier'}. Each single-use token can only be claimed once. Please request a fresh regenerated token from your Super Admin.`,
         workspaceName: tokenRecord.workspace?.name,
       };
     }
 
     // First-Open Browser Session Lock: Disallow simultaneous opening in a second browser (PostgreSQL Persisted)
-    if (tokenRecord.openedBySession && !isExistingLeader) {
+    if (tokenRecord.openedBySession) {
       const isExpired =
         tokenRecord.openedAt &&
         Date.now() - new Date(tokenRecord.openedAt).getTime() > 30 * 60 * 1000;
@@ -1546,7 +1546,7 @@ export class WorkspaceService {
           workspaceName: tokenRecord.workspace?.name,
         };
       }
-    } else if (sessionId && !isExistingLeader && !tokenRecord.openedBySession) {
+    } else if (sessionId && !tokenRecord.openedBySession) {
       await this.prisma.workspaceInviteToken.update({
         where: { id: tokenRecord.id },
         data: {
@@ -3969,6 +3969,32 @@ export class WorkspaceService {
       throw new BadRequestException('No admin owner found to anchor new specialized pod.');
     }
 
+    // Pod Allocation Rule: All existing pods must reach maximum capacity (8 members: 1 Leader + 7 Members)
+    // before deploying an additional pod (multiples of 8: 8 for Pod 2, 16 for Pod 3, 24 for Pod 4, etc.).
+    const targetOrgId = org?.id || owner.organizationId;
+    if (targetOrgId) {
+      const existingWorkspaces = await this.prisma.workspace.findMany({
+        where: { organizationId: targetOrgId },
+        include: { members: true },
+      });
+
+      const currentPodsCount = existingWorkspaces.length;
+      if (currentPodsCount > 0) {
+        const totalMembers = existingWorkspaces.reduce(
+          (sum, ws) => sum + (ws.members ? ws.members.length : 0),
+          0,
+        );
+        const requiredMembers = currentPodsCount * 8;
+        if (totalMembers < requiredMembers) {
+          const deficit = requiredMembers - totalMembers;
+          const nextPodNumber = currentPodsCount + 1;
+          throw new BadRequestException(
+            `Cannot deploy an additional pod. All existing pods must reach maximum capacity (8 members per pod: 1 Leader + 7 Agents) before expanding. Currently at ${totalMembers} of ${requiredMembers} members across ${currentPodsCount} pod${currentPodsCount > 1 ? 's' : ''}. Please add ${deficit} more member${deficit > 1 ? 's' : ''} to unlock Pod #${nextPodNumber}.`,
+          );
+        }
+      }
+    }
+
     const leaderTokenStr =
       'STX-LDR-' + crypto.randomBytes(3).toString('hex').toUpperCase();
 
@@ -4042,7 +4068,14 @@ export class WorkspaceService {
       throw new BadRequestException('Workspace pod not found.');
     }
 
-    const newAssignedQuota = (workspace.assignedQuota || workspace.maxMembers || 0) + count;
+    const currentQuota = workspace.assignedQuota || workspace.maxMembers || 0;
+    if (currentQuota + count > 8) {
+      throw new BadRequestException(
+        `Pod capacity cannot exceed 8 persons. Current capacity is ${currentQuota}, maximum addition allowed is ${Math.max(0, 8 - currentQuota)}.`,
+      );
+    }
+
+    const newAssignedQuota = currentQuota + count;
     const newMaxMembers = (workspace.maxMembers || 0) + count;
 
     // Update workspace quota
