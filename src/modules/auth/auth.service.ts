@@ -117,6 +117,29 @@ export class AuthService implements OnModuleInit {
       });
       if (!user) return null;
 
+      // Prevent duplicate ghost sessions: if there is already an active session created within the last 15 seconds, reuse it
+      const existingRecentSession = await this.prisma.userActivitySession.findFirst({
+        where: {
+          userId: user.id,
+          isOnline: true,
+          loginAt: {
+            gte: new Date(Date.now() - 15000),
+          },
+        },
+        orderBy: { loginAt: 'desc' },
+      });
+
+      if (existingRecentSession) {
+        return await this.prisma.userActivitySession.update({
+          where: { id: existingRecentSession.id },
+          data: {
+            lastHeartbeatAt: new Date(),
+            ...(workspaceId ? { workspaceId } : {}),
+            ...(role ? { role } : {}),
+          },
+        });
+      }
+
       // Close all previous active sessions for this user so they don't produce duplicate ghost online sessions
       await this.prisma.userActivitySession.updateMany({
         where: {
@@ -194,17 +217,16 @@ export class AuthService implements OnModuleInit {
           orderBy: { loginAt: 'desc' },
         });
 
+        // Only reject if Super Admin explicitly revoked this session under Zero-Trust protocol
         if (
           latestSession &&
           !latestSession.isOnline &&
-          (latestSession.logoutReason === 'ADMIN_FORCE_LOGOUT' ||
-            latestSession.logoutReason === 'MANUAL_LOGOUT' ||
-            latestSession.logoutReason === 'BROWSER_CLOSED')
+          latestSession.logoutReason === 'ADMIN_FORCE_LOGOUT'
         ) {
           return {
             success: false,
             active: false,
-            reason: latestSession.logoutReason,
+            reason: 'ADMIN_FORCE_LOGOUT',
           };
         }
 

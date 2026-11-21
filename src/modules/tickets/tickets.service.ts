@@ -27,61 +27,8 @@ export interface TicketRecord {
 export class TicketsService {
   private readonly logger = new Logger(TicketsService.name);
 
-  // In-memory fallback cache with enterprise realistic mock seed data
-  private memoryTickets: TicketRecord[] = [
-    {
-      id: 'tick-001',
-      ticketNumber: 1001,
-      title: 'Payment processed twice for annual subscription',
-      description:
-        'I clicked upgrade once, but my bank statement shows two identical charges of $1,200 on Oct 30. Please refund the duplicate immediately.',
-      status: 'OPEN',
-      priority: 'CRITICAL',
-      sentiment: 'FRUSTRATED',
-      tags: ['billing', 'duplicate-charge', 'refund'],
-      customerId: 'cust-01',
-      customerName: 'Sarah Jenkins (CTO, HyperScale Inc)',
-      assignedAgentId: 'agent-01',
-      assignedAgentName: 'Marcus Vance',
-      createdAt: new Date(Date.now() - 3600000 * 3).toISOString(),
-      updatedAt: new Date(Date.now() - 3600000 * 2).toISOString(),
-    },
-    {
-      id: 'tick-002',
-      ticketNumber: 1002,
-      title: 'Webhooks failing with 504 Gateway Timeout',
-      description:
-        'Our webhook endpoint is not receiving customer.created events since 09:00 AM UTC. We see retries timing out.',
-      status: 'NEW',
-      priority: 'HIGH',
-      sentiment: 'URGENT',
-      tags: ['api', 'webhook', 'timeout'],
-      customerId: 'cust-02',
-      customerName: 'Liam Chen (Lead Architect, FinPulse Dubai)',
-      assignedAgentId: null,
-      assignedAgentName: null,
-      createdAt: new Date(Date.now() - 3600000 * 1).toISOString(),
-      updatedAt: new Date(Date.now() - 3600000 * 1).toISOString(),
-    },
-    {
-      id: 'tick-003',
-      ticketNumber: 1003,
-      title:
-        '[VIP Escalation] SLA Breach Warning: Enterprise Penalty Credit & Contract Renewal Review',
-      description:
-        'Yesterday, our peak checkout experienced an unscheduled outage of 45 minutes, exceeding our 99.9% uptime SLA agreement. As a Tier-1 Enterprise account ($180k ARR), I am escalating this directly to your Support Team Lead to discuss SLA penalty credit compensation and infrastructure stability guarantees before our executive board finalizes next week\'s annual contract renewal.',
-      status: 'PENDING',
-      priority: 'HIGH',
-      sentiment: 'URGENT',
-      tags: ['vip-escalation', 'sla-breach', 'contract-renewal', 'tier1-client'],
-      customerId: 'cust-03',
-      customerName: 'Marcus Thorne (VP of Operations, Apex Global Retail)',
-      assignedAgentId: 'agent-01',
-      assignedAgentName: 'Marcus Vance',
-      createdAt: new Date(Date.now() - 3600000 * 12).toISOString(),
-      updatedAt: new Date(Date.now() - 3600000 * 5).toISOString(),
-    },
-  ];
+  // In-memory fallback cache
+  private memoryTickets: TicketRecord[] = [];
 
   constructor(
     private readonly prisma: PrismaService,
@@ -274,54 +221,9 @@ export class TicketsService {
         return list;
       }
 
-      // If database has no tickets yet, return demo tickets so dashboard is always populated!
-      let result = [...this.memoryTickets];
-      if (workspaceId && workspaceId !== 'ALL') {
-        result = result.filter((t) => t.workspaceId === workspaceId);
-      }
-      if (status && status !== 'ALL') result = result.filter((t) => t.status === status);
-      if (priority && priority !== 'ALL') result = result.filter((t) => t.priority === priority);
-      if (search) {
-        const query = search.toLowerCase();
-        result = result.filter(
-          (t) => t.title.toLowerCase().includes(query) || t.description.toLowerCase().includes(query),
-        );
-      }
-      if (isMember) {
-        result = result.filter(
-          (t) =>
-            t.ticketNumber !== 1003 &&
-            !t.tags.includes('vip-escalation') &&
-            !t.title.toLowerCase().includes('vip escalation') &&
-            !t.title.toLowerCase().includes('saml sso') &&
-            !t.title.toLowerCase().includes('okta'),
-        );
-      }
-      return result;
+      return [];
     } catch {
-      let result = [...this.memoryTickets];
-      if (workspaceId && workspaceId !== 'ALL') {
-        result = result.filter((t) => t.workspaceId === workspaceId);
-      }
-      if (status && status !== 'ALL') result = result.filter((t) => t.status === status);
-      if (priority && priority !== 'ALL') result = result.filter((t) => t.priority === priority);
-      if (search) {
-        const query = search.toLowerCase();
-        result = result.filter(
-          (t) => t.title.toLowerCase().includes(query) || t.description.toLowerCase().includes(query),
-        );
-      }
-      if (isMember) {
-        result = result.filter(
-          (t) =>
-            t.ticketNumber !== 1003 &&
-            !t.tags.includes('vip-escalation') &&
-            !t.title.toLowerCase().includes('vip escalation') &&
-            !t.title.toLowerCase().includes('saml sso') &&
-            !t.title.toLowerCase().includes('okta'),
-        );
-      }
-      return result;
+      return [];
     }
   }
 

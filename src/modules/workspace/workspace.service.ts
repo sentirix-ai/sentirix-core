@@ -178,7 +178,7 @@ export class WorkspaceService {
           name: `${user.fullName || user.username}'s Support Team`,
           ownerId: user.id,
           inviteToken: initialToken,
-          maxMembers: 8,
+          assignedQuota: 8,
           inviteTokens: {
             create: {
               token: initialToken,
@@ -585,9 +585,10 @@ export class WorkspaceService {
       throw new NotFoundException('Workspace not found for this invitation token.');
     }
 
-    if (workspace.members.length >= workspace.maxMembers) {
+    const effectiveQuota = workspace.assignedQuota || 8;
+    if (workspace.members.length >= effectiveQuota) {
       throw new BadRequestException(
-        `Workspace is full (${workspace.maxMembers}/${workspace.maxMembers} seats occupied).`,
+        `Workspace is full (${effectiveQuota}/${effectiveQuota} seats occupied).`,
       );
     }
 
@@ -1437,7 +1438,6 @@ export class WorkspaceService {
           podCategory: pod.podCategory || 'GENERAL',
           description: pod.description || null,
           services: pod.services || [],
-          maxMembers: 8,
           assignedQuota: 8,
           isQuotaLocked: false,
           inviteToken: leaderTokenStr,
@@ -2114,30 +2114,47 @@ export class WorkspaceService {
     // Release session lock once permanently claimed
     this.tokenOpenSessionLocks.delete(cleanToken);
 
-    // 6. Auto-generate exactly safeCount Single-Use Agent Tokens
+    // 6. Auto-generate exactly safeCount Single-Use Agent Tokens (reuse if already provisioned upon deploy)
+    const existingAgentTokens = await this.prisma.workspaceInviteToken.findMany({
+      where: { workspaceId: workspace.id, role: 'AGENT' },
+      orderBy: { createdAt: 'asc' },
+    });
+
     const agentTokens: any[] = [];
-    for (let i = 0; i < safeCount; i++) {
-      const agtTokenStr =
-        'STX-AGT-' + crypto.randomBytes(3).toString('hex').toUpperCase();
-      const agt = await this.prisma.workspaceInviteToken.create({
-        data: {
-          workspaceId: workspace.id,
-          token: agtTokenStr,
-          role: 'AGENT',
+    if (existingAgentTokens.length > 0) {
+      existingAgentTokens.forEach((agt) => {
+        agentTokens.push({
+          token: agt.token,
+          joinUrl: `http://localhost:3000/join?token=${agt.token}`,
+          isUsed: agt.isUsed,
+          usedBy: agt.usedBy,
+          isOpened: false,
+        });
+      });
+    } else {
+      for (let i = 0; i < safeCount; i++) {
+        const agtTokenStr =
+          'STX-AGT-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+        const agt = await this.prisma.workspaceInviteToken.create({
+          data: {
+            workspaceId: workspace.id,
+            token: agtTokenStr,
+            role: 'AGENT',
+            isUsed: false,
+          },
+        });
+        agentTokens.push({
+          token: agt.token,
+          joinUrl: `http://localhost:3000/join?token=${agt.token}`,
           isUsed: false,
-        },
-      });
-      agentTokens.push({
-        token: agt.token,
-        joinUrl: `http://localhost:3000/join?token=${agt.token}`,
-        isUsed: false,
-        usedBy: null,
-        isOpened: false,
-      });
+          usedBy: null,
+          isOpened: false,
+        });
+      }
     }
 
     this.logger.log(
-      `Leader "${cleanName}" locked Pod "${workspace.name}" with 1 leader + ${safeCount} agents. Generated ${agentTokens.length} single-use agent tokens.`,
+      `Leader "${cleanName}" locked Pod "${workspace.name}" with 1 leader + ${agentTokens.length} agents.`,
     );
 
     // 7. Emit WebSocket event for real-time quota sync and leader activation
@@ -2702,7 +2719,9 @@ export class WorkspaceService {
 
     const presenceList = allOrgUsers.map((u) => {
       const isSuperAdmin = u.role === 'SUPER_ADMIN' || u.id === user.id;
-      const isLeader = u.role === 'POD_LEADER' || u.workspaceMembership?.role === 'LEADER';
+      const isLeader = u.workspaceMembership
+        ? u.workspaceMembership.role === 'LEADER'
+        : u.role === 'POD_LEADER';
       const userRole = isSuperAdmin ? 'SUPER_ADMIN' : isLeader ? 'LEADER' : 'MEMBER';
       const podName =
         u.workspaceMembership?.workspace?.name ||
@@ -2760,7 +2779,18 @@ export class WorkspaceService {
       const lifetimeCustomersServed = realLifetimeServed > 0 ? realLifetimeServed : (seed ? seed.lifetime : 0);
       const avgHandlingTimeSeconds = realAhtSec > 0 ? realAhtSec : (seed ? seed.ahtSec : (isSuperAdmin ? 0 : 660));
 
-      const latestSession = u.activitySessions[0] || null;
+      // Filter out instant ghost sessions (e.g. sessions created and closed within < 5s with SESI_BARU_DIMULAI)
+      const validActivitySessions = u.activitySessions.filter((sess) => {
+        if (!sess.isOnline && sess.logoutReason === 'SESI_BARU_DIMULAI') {
+          const durMs = sess.logoutAt
+            ? new Date(sess.logoutAt).getTime() - new Date(sess.loginAt).getTime()
+            : 0;
+          if (durMs < 5000) return false;
+        }
+        return true;
+      });
+
+      const latestSession = validActivitySessions[0] || null;
       // Active session: isOnline = true and heartbeat within last 90 seconds (allows background tab switching)
       const isActuallyOnline = !!(
         latestSession &&
@@ -2825,8 +2855,8 @@ export class WorkspaceService {
       let reconnectedTime: Date | null = null;
       let disconnectDowntimeSeconds = 0;
 
-      for (let i = 0; i < u.activitySessions.length; i++) {
-        const sess = u.activitySessions[i];
+      for (let i = 0; i < validActivitySessions.length; i++) {
+        const sess = validActivitySessions[i];
         if (
           sess.logoutReason === 'UNEXPECTED_DISCONNECT' ||
           sess.logoutReason === 'BROWSER_CLOSED'
@@ -2834,7 +2864,7 @@ export class WorkspaceService {
           hadUnexpectedDisconnect = true;
           unexpectedDisconnectTime = sess.logoutAt || sess.lastHeartbeatAt;
           if (i > 0) {
-            const nextSess = u.activitySessions[i - 1];
+            const nextSess = validActivitySessions[i - 1];
             reconnectedTime = nextSess.loginAt;
             disconnectDowntimeSeconds = Math.max(
               0,
@@ -2849,7 +2879,7 @@ export class WorkspaceService {
         }
       }
 
-      const sessionHistory = u.activitySessions.map((sess, sIdx) => {
+      const sessionHistory = validActivitySessions.map((sess, sIdx) => {
         const durationSec = sess.logoutAt
           ? Math.max(
               0,
@@ -2866,7 +2896,7 @@ export class WorkspaceService {
 
         let reconnectedAt: Date | null = null;
         if (sIdx > 0) {
-          reconnectedAt = u.activitySessions[sIdx - 1].loginAt;
+          reconnectedAt = validActivitySessions[sIdx - 1].loginAt;
         }
 
         return {
@@ -3875,7 +3905,18 @@ export class WorkspaceService {
       },
     });
 
-    // 2. Update active sessions
+    // 2. Synchronize user.role on User table
+    await this.prisma.user.update({
+      where: { id: userAId },
+      data: { role: roleB === 'LEADER' ? 'POD_LEADER' : 'AGENT' },
+    });
+
+    await this.prisma.user.update({
+      where: { id: userBId },
+      data: { role: roleA === 'LEADER' ? 'POD_LEADER' : 'AGENT' },
+    });
+
+    // 3. Update active sessions
     await this.prisma.userActivitySession.updateMany({
       where: { userId: userAId, isOnline: true },
       data: { workspaceId: workspaceBId, role: roleB },
@@ -3966,70 +4007,99 @@ export class WorkspaceService {
     services?: string[];
     quota?: number;
     organizationId?: string;
+    requesterIdentifier?: string;
   }) {
     const cleanName = (dto.name || '').trim();
     if (!cleanName) {
       throw new BadRequestException('Pod name is required.');
     }
 
-    // Find the primary organization or fallback
+    // 1. Resolve Organization: prioritize specified organizationId, fallback to requester's org or database
     let org = null;
     if (dto.organizationId) {
       org = await this.prisma.organization.findUnique({
         where: { id: dto.organizationId },
       });
     }
+
+    // 2. Resolve Super Admin Owner: prioritize requesterIdentifier, then admin in org, then fallback
+    let owner = null;
+    if (dto.requesterIdentifier) {
+      owner = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { id: dto.requesterIdentifier },
+            { username: dto.requesterIdentifier },
+            { email: dto.requesterIdentifier },
+          ],
+        },
+      });
+    }
+
+    if (!owner && org) {
+      owner = await this.prisma.user.findFirst({
+        where: {
+          organizationId: org.id,
+          role: 'SUPER_ADMIN',
+        },
+      });
+      if (!owner) {
+        owner = await this.prisma.user.findFirst({
+          where: { organizationId: org.id },
+        });
+      }
+    }
+
+    if (!owner) {
+      owner = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { username: 'pungkyrama' },
+            { role: 'SUPER_ADMIN' },
+          ],
+        },
+        orderBy: { createdAt: 'asc' },
+      });
+    }
+
+    if (!owner) {
+      throw new BadRequestException('No admin owner found to anchor new specialized pod.');
+    }
+
+    if (!org && owner?.organizationId) {
+      org = await this.prisma.organization.findUnique({
+        where: { id: owner.organizationId },
+      });
+    }
+
     if (!org) {
       org = await this.prisma.organization.findFirst({
         orderBy: { createdAt: 'asc' },
       });
     }
 
-    // Find the super admin owner (e.g., @pungkyrama or first admin)
-    const owner = await this.prisma.user.findFirst({
-      where: {
-        OR: [
-          { username: 'pungkyrama' },
-          { role: 'SUPER_ADMIN' },
-        ],
-      },
-      orderBy: { createdAt: 'asc' },
-    });
-
-    if (!owner) {
-      throw new BadRequestException('No admin owner found to anchor new specialized pod.');
-    }
-
-    // Pod Allocation Rule: All existing pods must reach maximum capacity (8 members: 1 Leader + 7 Members)
-    // before deploying an additional pod (multiples of 8: 8 for Pod 2, 16 for Pod 3, 24 for Pod 4, etc.).
-    const targetOrgId = org?.id || owner.organizationId;
-    if (targetOrgId) {
-      const existingWorkspaces = await this.prisma.workspace.findMany({
-        where: { organizationId: targetOrgId },
-        include: { members: true },
-      });
-
-      const currentPodsCount = existingWorkspaces.length;
-      if (currentPodsCount > 0) {
-        const totalMembers = existingWorkspaces.reduce(
-          (sum, ws) => sum + (ws.members ? ws.members.length : 0),
-          0,
-        );
-        const requiredMembers = currentPodsCount * 8;
-        if (totalMembers < requiredMembers) {
-          const deficit = requiredMembers - totalMembers;
-          const nextPodNumber = currentPodsCount + 1;
-          throw new BadRequestException(
-            `Additional pod locked. All current pods must reach full capacity (8 members: 1 Leader + 7 Agents) before you can deploy a new pod. Currently at ${totalMembers} of ${requiredMembers} members across ${currentPodsCount} pod${currentPodsCount > 1 ? 's' : ''}. Please add ${deficit} more member${deficit > 1 ? 's' : ''} to unlock Pod #${nextPodNumber}.`,
-          );
-        }
-      }
-    }
-
     const leaderTokenStr =
       'STX-LDR-' + crypto.randomBytes(3).toString('hex').toUpperCase();
 
-    const assignedQuota = Math.max(1, Math.min(dto.quota || 3, 50));
+    const assignedQuota = Math.max(1, Math.min(dto.quota || 2, 50));
+    const agentSeatsCount = Math.max(0, assignedQuota - 1);
+
+    // Prepare initial tokens: 1 Leader + (assignedQuota - 1) Agents
+    const initialTokens: Array<{ token: string; role: string; isUsed: boolean }> = [
+      {
+        token: leaderTokenStr,
+        role: 'LEADER',
+        isUsed: false,
+      },
+    ];
+
+    for (let i = 0; i < agentSeatsCount; i++) {
+      initialTokens.push({
+        token: 'STX-AGT-' + crypto.randomBytes(3).toString('hex').toUpperCase(),
+        role: 'AGENT',
+        isUsed: false,
+      });
+    }
 
     const workspace = await this.prisma.workspace.create({
       data: {
@@ -4037,18 +4107,14 @@ export class WorkspaceService {
         podCategory: dto.podCategory || 'ENTERPRISE_VIP',
         description: dto.description || null,
         services: dto.services && dto.services.length > 0 ? dto.services : ['VIP Priority Escalation', 'Dispute Resolution'],
-        maxMembers: assignedQuota,
         assignedQuota: assignedQuota,
-        isQuotaLocked: false,
+        isQuotaLocked: true,
+        lockedAt: new Date(),
         inviteToken: leaderTokenStr,
         ownerId: owner.id,
         organizationId: org?.id || owner.organizationId || null,
         inviteTokens: {
-          create: {
-            token: leaderTokenStr,
-            role: 'LEADER',
-            isUsed: false,
-          },
+          create: initialTokens,
         },
       },
       include: {
@@ -4057,7 +4123,7 @@ export class WorkspaceService {
     });
 
     this.logger.log(
-      `Super Admin created specialized pod "${cleanName}" (${workspace.id}) with initial quota ${assignedQuota} and Leader Token ${leaderTokenStr}.`,
+      `Super Admin created specialized pod "${cleanName}" (${workspace.id}) with initial quota ${assignedQuota} (1 Leader + ${agentSeatsCount} Agents). Issued ${initialTokens.length} tokens.`,
     );
 
     return {

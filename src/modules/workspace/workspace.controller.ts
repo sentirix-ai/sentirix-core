@@ -472,6 +472,7 @@ export class WorkspaceController {
       services?: string[];
       quota?: number;
       organizationId?: string;
+      requesterIdentifier?: string;
     },
   ) {
     if (!body?.name?.trim()) {
