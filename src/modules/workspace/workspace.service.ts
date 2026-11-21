@@ -41,6 +41,12 @@ export interface WorkspaceDetailResponse {
   currentMembersCount: number;
   remainingSeats: number;
   members: WorkspaceMemberInfo[];
+  pendingTokens?: Array<{
+    id: string;
+    token: string;
+    role: string;
+    createdAt: Date | string;
+  }>;
 }
 
 const CORPORATE_ACRONYMS = new Set([
@@ -157,8 +163,8 @@ export class WorkspaceService {
       throw new NotFoundException(`User ${identifier} not found.`);
     }
 
-    if (user.role === 'ADMIN' || user.username === 'pungkyrama') {
-      throw new ForbiddenException('Admin accounts are excluded from workspace team links.');
+    if (user.role === 'SUPER_ADMIN' || user.username === 'pungkyrama') {
+      throw new ForbiddenException('Super Admin accounts are excluded from workspace team links.');
     }
 
     // Check if user belongs to a Pod workspace first, then ownedWorkspaces
@@ -204,13 +210,14 @@ export class WorkspaceService {
     }
 
     const isLeader =
+      user.role === 'POD_LEADER' ||
       user.workspaceMembership?.role === 'LEADER' ||
       (user.role as string) === 'LEADER' ||
       workspace.ownerId === user.id;
 
-    const totalPodQuota = workspace.assignedQuota || workspace.maxMembers || 5;
+    const totalPodQuota = workspace.assignedQuota || 8;
     // For Leader, Active Team Capacity reflects the member quota (excluding leader).
-    // E.g. Pod 1 has assignedQuota = 5 (1 Leader + 4 Members) -> capacity = 4 SEATS!
+    // E.g. Pod 1 has assignedQuota = 8 (1 Leader + 7 Members) -> capacity = 7 SEATS!
     const effectiveMaxMembers = isLeader ? Math.max(1, totalPodQuota - 1) : totalPodQuota;
 
     // Filter subordinate members (exclude the Leader themself)
@@ -307,6 +314,20 @@ export class WorkspaceService {
 
     const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
 
+    // Collect all unclaimed/pending AGENT tokens for this workspace
+    // sorted by createdAt: 'asc' so token #1, #2, ... match Super Admin Cockpit order
+    const pendingTokens = isLeader
+      ? (workspace.inviteTokens || [])
+          .filter((t) => (t.role === 'AGENT' || !t.role) && !t.isUsed && (!t.usedBy || t.usedBy.trim() === ''))
+          .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+          .map((t) => ({
+            id: t.id,
+            token: t.token,
+            role: t.role || 'AGENT',
+            createdAt: t.createdAt,
+          }))
+      : [];
+
     return {
       workspaceId: workspace.id,
       name: workspace.name,
@@ -321,6 +342,7 @@ export class WorkspaceService {
       currentMembersCount,
       remainingSeats,
       members: membersList,
+      pendingTokens,
     };
   }
 
@@ -359,8 +381,10 @@ export class WorkspaceService {
     }
 
     const isLeader =
+      user.role === 'POD_LEADER' ||
       user.workspaceMembership?.role === 'LEADER' ||
       (user.role as string) === 'LEADER' ||
+      user.role === 'SUPER_ADMIN' ||
       activeWorkspace.ownerId === user.id;
 
     if (!isLeader) {
@@ -369,7 +393,7 @@ export class WorkspaceService {
       );
     }
 
-    const totalPodQuota = activeWorkspace.assignedQuota || activeWorkspace.maxMembers || 5;
+    const totalPodQuota = activeWorkspace.assignedQuota || 8;
     const effectiveMaxMembers = isLeader ? Math.max(1, totalPodQuota - 1) : totalPodQuota;
     const subordinateMembers = isLeader
       ? activeWorkspace.members.filter((m) => m.userId !== user.id && m.role !== 'LEADER')
@@ -449,8 +473,8 @@ export class WorkspaceService {
         workspaceName: wsFallback.name,
         ownerName: wsFallback.owner.fullName || wsFallback.owner.username,
         currentMembers: wsFallback.members.length,
-        maxMembers: wsFallback.maxMembers,
-        remainingSeats: wsFallback.maxMembers - wsFallback.members.length,
+        maxMembers: wsFallback.assignedQuota,
+        remainingSeats: wsFallback.assignedQuota - wsFallback.members.length,
       };
     }
 
@@ -491,10 +515,10 @@ export class WorkspaceService {
     }
 
     const memberCount = tokenRecord.workspace.members.length;
-    if (memberCount >= tokenRecord.workspace.maxMembers) {
+    if (memberCount >= tokenRecord.workspace.assignedQuota) {
       return {
         valid: false,
-        error: `This workspace has reached its maximum team capacity of ${tokenRecord.workspace.maxMembers} members.`,
+        error: `This workspace has reached its maximum team capacity of ${tokenRecord.workspace.assignedQuota} members.`,
         workspaceName: tokenRecord.workspace.name,
         ownerName: tokenRecord.workspace.owner.fullName || tokenRecord.workspace.owner.username,
       };
@@ -506,8 +530,8 @@ export class WorkspaceService {
       workspaceName: tokenRecord.workspace.name,
       ownerName: tokenRecord.workspace.owner.fullName || tokenRecord.workspace.owner.username,
       currentMembers: memberCount,
-      maxMembers: tokenRecord.workspace.maxMembers,
-      remainingSeats: tokenRecord.workspace.maxMembers - memberCount,
+      maxMembers: tokenRecord.workspace.assignedQuota,
+      remainingSeats: tokenRecord.workspace.assignedQuota - memberCount,
     };
   }
 
@@ -969,7 +993,7 @@ export class WorkspaceService {
     if (workspace) {
       workspace = await this.prisma.workspace.update({
         where: { id: workspace.id },
-        data: { maxMembers: clampedCapacity },
+        data: { assignedQuota: clampedCapacity },
       });
     } else {
       const initialToken = `inv_${crypto.randomBytes(8).toString('hex')}`;
@@ -978,7 +1002,7 @@ export class WorkspaceService {
           name: `${user.fullName || user.username}'s Support Team`,
           ownerId: user.id,
           inviteToken: initialToken,
-          maxMembers: clampedCapacity,
+          assignedQuota: clampedCapacity,
           inviteTokens: {
             create: {
               token: initialToken,
@@ -1095,7 +1119,7 @@ export class WorkspaceService {
           name: pod.name,
           podCategory: pod.podCategory || 'GENERAL',
           description: pod.description || null,
-          maxMembers: Math.max(1, Math.min(8, Number(pod.seats) || 8)),
+          assignedQuota: Math.max(1, Math.min(8, Number(pod.seats) || 8)),
           inviteToken: initialToken,
           ownerId: user.id,
           organizationId: organization.id,
@@ -1124,7 +1148,7 @@ export class WorkspaceService {
           podCategory: 'CATCH_ALL',
           description: 'Safety-net triage queue for unmapped or new customer topics',
           isCatchAll: true,
-          maxMembers: 8,
+          assignedQuota: 8,
           inviteToken: catchAllToken,
           ownerId: user.id,
           organizationId: organization.id,
@@ -1158,7 +1182,8 @@ export class WorkspaceService {
         podCategory: w.podCategory,
         description: w.description,
         isCatchAll: w.isCatchAll,
-        maxMembers: w.maxMembers,
+        assignedQuota: w.assignedQuota,
+        maxMembers: w.assignedQuota,
         inviteToken: w.inviteToken,
       })),
     };
@@ -1227,7 +1252,8 @@ export class WorkspaceService {
           podCategory: p.podCategory,
           description: p.description,
           isCatchAll: p.isCatchAll,
-          maxMembers: p.maxMembers,
+          assignedQuota: p.assignedQuota,
+          maxMembers: p.assignedQuota,
           currentMembersCount: p.members?.length || 0,
           openTicketsCount: openTickets,
           inviteToken: p.inviteToken,
@@ -1270,7 +1296,7 @@ export class WorkspaceService {
         name: dto.name,
         podCategory: dto.podCategory || 'CUSTOM',
         description: dto.description || null,
-        maxMembers: Math.max(1, Math.min(8, Number(dto.maxMembers) || 8)),
+        assignedQuota: Math.max(1, Math.min(8, Number(dto.maxMembers) || 8)),
         inviteToken: initialToken,
         ownerId: user.id,
         organizationId: user.organizationId || null,
@@ -1296,7 +1322,8 @@ export class WorkspaceService {
         podCategory: newPod.podCategory,
         description: newPod.description,
         isCatchAll: newPod.isCatchAll,
-        maxMembers: newPod.maxMembers,
+        assignedQuota: newPod.assignedQuota,
+        maxMembers: newPod.assignedQuota,
         currentMembersCount: newPod.members.length,
         inviteToken: newPod.inviteToken,
       },
@@ -1369,12 +1396,12 @@ export class WorkspaceService {
       });
     }
 
-    // 2. Link User to Organization as ADMIN (Onboarding will only complete once Done Sharing is clicked)
+    // 2. Link User to Organization as SUPER_ADMIN (Onboarding will only complete once Done Sharing is clicked)
     await this.prisma.user.update({
       where: { id: user.id },
       data: {
         organizationId: organization.id,
-        role: 'ADMIN',
+        role: 'SUPER_ADMIN',
         onboardingCompleted: false,
       },
     });
@@ -1759,7 +1786,6 @@ export class WorkspaceService {
         where: { id: workspace.id },
         data: {
           assignedQuota: totalPodQuota,
-          maxMembers: totalPodQuota,
           isQuotaLocked: true,
           lockedAt: new Date(),
         },
@@ -1782,7 +1808,6 @@ export class WorkspaceService {
             where: { id: remainingUnlocked[0].id },
             data: {
               assignedQuota: remainderSeats,
-              maxMembers: remainderSeats,
             },
           });
         }
@@ -1980,7 +2005,7 @@ export class WorkspaceService {
         fullName: cleanName,
         email,
         passwordHash,
-        role: 'AGENT',
+        role: 'POD_LEADER',
         organizationId: workspace.organizationId,
         onboardingCompleted: true,
       },
@@ -2001,7 +2026,6 @@ export class WorkspaceService {
       where: { id: workspace.id },
       data: {
         assignedQuota: totalPodQuota,
-        maxMembers: totalPodQuota,
         isQuotaLocked: true,
         lockedAt: new Date(),
       },
@@ -2040,7 +2064,6 @@ export class WorkspaceService {
             where: { id: otherPod.id },
             data: {
               assignedQuota: remainder,
-              maxMembers: remainder,
             },
           });
           this.logger.log(
@@ -2349,9 +2372,9 @@ export class WorkspaceService {
       );
     } else {
       // New member joining: check capacity strictly
-      if (workspace.members.length >= workspace.maxMembers) {
+      if (workspace.members.length >= workspace.assignedQuota) {
         throw new BadRequestException(
-          `Pod capacity is already filled (${workspace.members.length}/${workspace.maxMembers} seats).`,
+          `Pod capacity is already filled (${workspace.members.length}/${workspace.assignedQuota} seats).`,
         );
       }
 
@@ -2633,7 +2656,7 @@ export class WorkspaceService {
         services: ws.services,
         isQuotaLocked: ws.isQuotaLocked,
         assignedQuota: ws.assignedQuota,
-        maxMembers: ws.maxMembers,
+        maxMembers: ws.assignedQuota,
         membersCount: ws.members.length,
         leaderName: leaderMember?.user?.fullName || null,
         leaderClaimed: !!leaderMember,
@@ -2678,8 +2701,8 @@ export class WorkspaceService {
     });
 
     const presenceList = allOrgUsers.map((u) => {
-      const isSuperAdmin = u.role === 'ADMIN' || u.id === user.id;
-      const isLeader = u.workspaceMembership?.role === 'LEADER';
+      const isSuperAdmin = u.role === 'SUPER_ADMIN' || u.id === user.id;
+      const isLeader = u.role === 'POD_LEADER' || u.workspaceMembership?.role === 'LEADER';
       const userRole = isSuperAdmin ? 'SUPER_ADMIN' : isLeader ? 'LEADER' : 'MEMBER';
       const podName =
         u.workspaceMembership?.workspace?.name ||
@@ -2998,7 +3021,7 @@ export class WorkspaceService {
     // Calculate total effective capacity: if all active pods are locked, derive authoritative capacity from sum of assignedQuota
     const lockedPodsSum = workspaces
       .filter((w) => w.isQuotaLocked)
-      .reduce((sum, w) => sum + (w.assignedQuota || w.maxMembers || 0), 0);
+      .reduce((sum, w) => sum + (w.assignedQuota || 0), 0);
     const effectiveTotalSeats =
       lockedPodsSum > 0 && totalLockedPods === workspaces.length
         ? lockedPodsSum
@@ -3109,7 +3132,7 @@ export class WorkspaceService {
       });
 
       const isSuperAdmin =
-        requester?.role === 'ADMIN' ||
+        requester?.role === 'SUPER_ADMIN' ||
         requester?.username?.toLowerCase() === 'pungkyrama';
 
       const isCurrentPodLeader =
@@ -3326,7 +3349,7 @@ export class WorkspaceService {
     await this.prisma.user.update({
       where: { id: user.id },
       data: {
-        role: 'ADMIN',
+        role: 'SUPER_ADMIN',
         onboardingCompleted: true,
       },
     });
@@ -3584,7 +3607,7 @@ export class WorkspaceService {
     // 4. Update User role
     await this.prisma.user.update({
       where: { id: user.id },
-      data: { role: 'AGENT' },
+      data: { role: newRole === 'LEADER' ? 'POD_LEADER' : 'AGENT' },
     });
 
     // 5. Update active UserActivitySession
@@ -3676,6 +3699,10 @@ export class WorkspaceService {
         where: { userId: currentLeaderMember.userId, isOnline: true },
         data: { role: 'AGENT' },
       });
+      await this.prisma.user.update({
+        where: { id: currentLeaderMember.userId },
+        data: { role: 'AGENT' },
+      });
     }
 
     // 2. Promote targetMember to LEADER
@@ -3683,9 +3710,13 @@ export class WorkspaceService {
       where: { id: targetMember.id },
       data: { role: 'LEADER' },
     });
+    await this.prisma.user.update({
+      where: { id: targetMember.userId },
+      data: { role: 'POD_LEADER' },
+    });
     await this.prisma.userActivitySession.updateMany({
       where: { userId: targetMember.userId, isOnline: true },
-      data: { role: 'LEADER' },
+      data: { role: 'POD_LEADER' },
     });
 
     const newLeaderName = targetMember.user.fullName || targetMember.user.username;
@@ -3959,7 +3990,7 @@ export class WorkspaceService {
       where: {
         OR: [
           { username: 'pungkyrama' },
-          { role: 'ADMIN' },
+          { role: 'SUPER_ADMIN' },
         ],
       },
       orderBy: { createdAt: 'asc' },
@@ -3989,7 +4020,7 @@ export class WorkspaceService {
           const deficit = requiredMembers - totalMembers;
           const nextPodNumber = currentPodsCount + 1;
           throw new BadRequestException(
-            `Cannot deploy an additional pod. All existing pods must reach maximum capacity (8 members per pod: 1 Leader + 7 Agents) before expanding. Currently at ${totalMembers} of ${requiredMembers} members across ${currentPodsCount} pod${currentPodsCount > 1 ? 's' : ''}. Please add ${deficit} more member${deficit > 1 ? 's' : ''} to unlock Pod #${nextPodNumber}.`,
+            `Additional pod locked. All current pods must reach full capacity (8 members: 1 Leader + 7 Agents) before you can deploy a new pod. Currently at ${totalMembers} of ${requiredMembers} members across ${currentPodsCount} pod${currentPodsCount > 1 ? 's' : ''}. Please add ${deficit} more member${deficit > 1 ? 's' : ''} to unlock Pod #${nextPodNumber}.`,
           );
         }
       }
@@ -4068,7 +4099,7 @@ export class WorkspaceService {
       throw new BadRequestException('Workspace pod not found.');
     }
 
-    const currentQuota = workspace.assignedQuota || workspace.maxMembers || 0;
+    const currentQuota = workspace.assignedQuota || 0;
     if (currentQuota + count > 8) {
       throw new BadRequestException(
         `Pod capacity cannot exceed 8 persons. Current capacity is ${currentQuota}, maximum addition allowed is ${Math.max(0, 8 - currentQuota)}.`,
@@ -4076,14 +4107,12 @@ export class WorkspaceService {
     }
 
     const newAssignedQuota = currentQuota + count;
-    const newMaxMembers = (workspace.maxMembers || 0) + count;
 
     // Update workspace quota
     const updatedWorkspace = await this.prisma.workspace.update({
       where: { id: workspace.id },
       data: {
         assignedQuota: newAssignedQuota,
-        maxMembers: newMaxMembers,
       },
     });
 
@@ -4120,7 +4149,7 @@ export class WorkspaceService {
         id: updatedWorkspace.id,
         name: updatedWorkspace.name,
         assignedQuota: updatedWorkspace.assignedQuota,
-        maxMembers: updatedWorkspace.maxMembers,
+        maxMembers: updatedWorkspace.assignedQuota,
         isQuotaLocked: updatedWorkspace.isQuotaLocked,
       },
       newTokens: generatedTokens,
@@ -4149,7 +4178,7 @@ export class WorkspaceService {
         },
       });
       const isSuperAdmin =
-        requester?.role === 'ADMIN' ||
+        requester?.role === 'SUPER_ADMIN' ||
         requester?.username?.toLowerCase() === 'pungkyrama';
       if (!isSuperAdmin) {
         throw new ForbiddenException(
@@ -4196,7 +4225,7 @@ export class WorkspaceService {
       throw new NotFoundException('Target personnel account not found to force logout.');
     }
 
-    if (targetUser.role === 'ADMIN' || targetUser.username?.toLowerCase() === 'pungkyrama') {
+    if (targetUser.role === 'SUPER_ADMIN' || targetUser.username?.toLowerCase() === 'pungkyrama') {
       throw new BadRequestException('Cannot force logout Super Administrator.');
     }
 

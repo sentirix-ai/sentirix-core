@@ -19,6 +19,8 @@ model Organization {
   updatedAt                 DateTime    @updatedAt
   users                     User[]
   workspaces                Workspace[]
+  activitySessions          UserActivitySession[]
+  knowledgeArticles         KnowledgeArticle[]
 
   @@map("organizations")
 }
@@ -51,26 +53,27 @@ model User {
 }
 
 model Workspace {
-  id             String                 @id @default(uuid())
-  name           String
-  inviteToken    String                 @default(uuid())
-  ownerId        String
-  maxMembers     Int                    @default(8)
-  createdAt      DateTime               @default(now())
-  updatedAt      DateTime               @updatedAt
-  description    String?
-  isCatchAll     Boolean                @default(false)
-  organizationId String?
-  podCategory    String                 @default("GENERAL")
-  assignedQuota  Int                    @default(8)
-  isQuotaLocked  Boolean                @default(false)
-  lockedAt       DateTime?
-  services       String[]               @default([])
-  tickets        Ticket[]               @relation("WorkspaceTickets")
-  inviteTokens   WorkspaceInviteToken[]
-  members        WorkspaceMember[]
-  organization   Organization?          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  owner          User                   @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  id               String                 @id @default(uuid())
+  name             String
+  inviteToken      String                 @default(uuid())
+  ownerId          String
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+  description      String?
+  isCatchAll       Boolean                @default(false)
+  organizationId   String?
+  podCategory      String                 @default("GENERAL")
+  assignedQuota    Int                    @default(8)
+  isQuotaLocked    Boolean                @default(false)
+  lockedAt         DateTime?
+  services         String[]               @default([])
+  tickets          Ticket[]               @relation("WorkspaceTickets")
+  inviteTokens     WorkspaceInviteToken[]
+  members          WorkspaceMember[]
+  organization     Organization?          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  owner            User                   @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  activitySessions UserActivitySession[]
+  knowledgeArticles KnowledgeArticle[]
 
   @@index([organizationId])
   @@index([ownerId])
@@ -153,15 +156,21 @@ model Message {
 }
 
 model KnowledgeArticle {
-  id        String   @id @default(uuid())
-  title     String
-  content   String
-  category  String
-  tags      String[] @default([])
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id             String        @id @default(uuid())
+  title          String
+  content        String
+  category       String
+  tags           String[]      @default([])
+  isActive       Boolean       @default(true)
+  organizationId String?
+  workspaceId    String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  workspace      Workspace?    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
+  @@index([organizationId])
+  @@index([workspaceId])
   @@map("knowledge_articles")
 }
 
@@ -180,19 +189,21 @@ model AuditLog {
 }
 
 model UserActivitySession {
-  id              String    @id @default(uuid())
+  id              String        @id @default(uuid())
   userId          String
   organizationId  String?
   workspaceId     String?
-  role            String    @default("AGENT")
-  loginAt         DateTime  @default(now())
-  lastHeartbeatAt DateTime  @default(now())
+  role            String        @default("AGENT")
+  loginAt         DateTime      @default(now())
+  lastHeartbeatAt DateTime      @default(now())
   logoutAt        DateTime?
   logoutReason    String?
-  isOnline        Boolean   @default(true)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isOnline        Boolean       @default(true)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization    Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  workspace       Workspace?    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([organizationId])
@@ -201,7 +212,8 @@ model UserActivitySession {
 }
 
 enum Role {
-  ADMIN
+  SUPER_ADMIN
+  POD_LEADER
   AGENT
   CUSTOMER
 }

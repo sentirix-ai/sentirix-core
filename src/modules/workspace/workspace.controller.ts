@@ -168,6 +168,7 @@ export class WorkspaceController {
       podCategory?: string;
       description?: string;
       maxMembers?: number;
+      assignedQuota?: number;
     },
   ) {
     if (!identifier || !dto.name) {

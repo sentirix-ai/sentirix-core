@@ -134,7 +134,7 @@ export class TicketsService {
       }
       if (finalCustomerId === 'usr-admin-01') {
         const defaultUser = await this.prisma.user.findFirst({
-          where: { OR: [{ role: 'ADMIN' }, { username: 'pungkyrama' }] },
+          where: { OR: [{ role: 'SUPER_ADMIN' }, { username: 'pungkyrama' }] },
         });
         if (defaultUser) finalCustomerId = defaultUser.id;
       }

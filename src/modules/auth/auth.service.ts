@@ -19,7 +19,7 @@ export interface AuthUserResponse {
   fullName?: string;
   email: string;
   phone?: string;
-  role: 'ADMIN' | 'USER' | 'LEADER';
+  role: 'SUPER_ADMIN' | 'POD_LEADER' | 'AGENT' | 'CUSTOMER' | 'ADMIN' | 'USER' | 'LEADER';
   workspaceRole?: string;
   workspaceId?: string;
   workspaceName?: string;
@@ -90,10 +90,10 @@ export class AuthService implements OnModuleInit {
             email: 'admin@sentrix.enterprise',
             phone: '+1-555-019-0000',
             passwordHash: this.hashPassword('0o0o 0o0o'),
-            role: 'ADMIN',
+            role: 'SUPER_ADMIN',
           },
         });
-        this.logger.log('Default Admin user (@pungkyrama) seeded into database.');
+        this.logger.log('Default Super Admin user (@pungkyrama) seeded into database.');
       }
     } catch (err) {
       this.logger.warn(`Could not seed default admin into db: ${(err as Error)?.message}`);
@@ -132,11 +132,11 @@ export class AuthService implements OnModuleInit {
 
       const effectiveRole =
         role ||
-        (user.workspaceMembership?.role === 'LEADER'
-          ? 'LEADER'
-          : user.role === 'ADMIN'
-            ? 'SUPER_ADMIN'
-            : 'AGENT');
+        (user.role === 'SUPER_ADMIN'
+          ? 'SUPER_ADMIN'
+          : user.role === 'POD_LEADER' || user.workspaceMembership?.role === 'LEADER'
+            ? 'POD_LEADER'
+            : user.role || 'AGENT');
       const effectiveWorkspaceId =
         workspaceId || user.workspaceMembership?.workspaceId || null;
 
@@ -447,7 +447,7 @@ export class AuthService implements OnModuleInit {
       };
     }
 
-    if (dto.role === 'ADMIN') {
+    if (dto.role === 'ADMIN' || (dto.role as any) === 'SUPER_ADMIN') {
       throw new UnauthorizedException(
         'Invalid Admin credentials. Hint: username "pungkyrama" and password "0o0o 0o0o"',
       );
@@ -495,7 +495,7 @@ export class AuthService implements OnModuleInit {
           fullName: (dbUser.fullName || dbUser.username) ?? undefined,
           email: dbUser.email,
           phone: dbUser.phone || undefined,
-          role: dbUser.role === 'ADMIN' ? 'ADMIN' : (isLeader ? 'LEADER' : 'USER'),
+          role: dbUser.role === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : dbUser.role === 'POD_LEADER' || isLeader ? 'POD_LEADER' : dbUser.role,
           workspaceRole: wsRole || undefined,
           workspaceId: dbUser.workspaceMembership?.workspaceId || undefined,
           workspaceName: dbUser.workspaceMembership?.workspace?.name || undefined,

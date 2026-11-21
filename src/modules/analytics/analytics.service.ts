@@ -119,7 +119,7 @@ export class AnalyticsService {
     };
 
     workspaces.forEach((ws) => {
-      const cap = ws.maxMembers || 8;
+      const cap = ws.assignedQuota || 8;
       if (capacityCounts[cap] !== undefined) {
         capacityCounts[cap]++;
       }
@@ -184,9 +184,10 @@ export class AnalyticsService {
           ? {
               id: ws.id,
               name: ws.name,
-              maxMembers: ws.maxMembers,
+              maxMembers: ws.assignedQuota,
+              assignedQuota: ws.assignedQuota,
               currentMembersCount: ws.members.length,
-              remainingSeats: Math.max(0, ws.maxMembers - ws.members.length),
+              remainingSeats: Math.max(0, ws.assignedQuota - ws.members.length),
               totalTokensGenerated: ws.inviteTokens.length,
             }
           : null,
