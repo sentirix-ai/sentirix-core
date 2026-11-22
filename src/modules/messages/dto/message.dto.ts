@@ -1,5 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsBoolean, IsEnum, IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsArray, IsBoolean, IsEnum, IsNotEmpty, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
+import { AttachmentDto } from '../../ai/dto/attachment.dto.js';
 
 export class CreateMessageDto {
   @ApiProperty({ example: 'tick-001' })
@@ -34,4 +36,26 @@ export class CreateMessageDto {
   @IsOptional()
   @IsBoolean()
   aiGenerated?: boolean = false;
+
+  @ApiPropertyOptional({ type: [AttachmentDto], description: 'Optional screenshots or proof documents' })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => AttachmentDto)
+  attachments?: AttachmentDto[];
+
+  @ApiPropertyOptional({ example: 'receipt.pdf' })
+  @IsOptional()
+  @IsString()
+  attachmentName?: string;
+
+  @ApiPropertyOptional({ example: 'application/pdf' })
+  @IsOptional()
+  @IsString()
+  attachmentType?: string;
+
+  @ApiPropertyOptional({ description: 'Base64 data or data URL' })
+  @IsOptional()
+  @IsString()
+  attachmentData?: string;
 }

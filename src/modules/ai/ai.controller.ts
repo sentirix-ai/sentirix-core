@@ -15,7 +15,10 @@ export class AiController {
   @ApiOperation({ summary: 'Analyze ticket sentiment, urgency priority, and auto-tags via Gemini AI' })
   @ApiResponse({ status: 200, type: AnalyzeTicketResponseDto })
   async analyzeTicket(@Body() dto: AnalyzeTicketDto): Promise<AnalyzeTicketResponseDto> {
-    return this.aiService.analyzeTicket(dto.title, dto.description);
+    return this.aiService.analyzeTicket(dto.title, dto.description, {
+      industry: dto.industry,
+      attachments: dto.attachments,
+    });
   }
 
   @Post('draft-reply')

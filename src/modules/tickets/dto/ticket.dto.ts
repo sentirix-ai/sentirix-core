@@ -1,5 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsArray, IsEnum, IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsArray, IsEnum, IsNotEmpty, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
+import { AttachmentDto } from '../../ai/dto/attachment.dto.js';
 
 export class CreateTicketDto {
   @ApiProperty({ example: 'Production database latency is critical after v2.4 upgrade' })
@@ -34,6 +36,28 @@ export class CreateTicketDto {
   @IsOptional()
   @IsString()
   workspaceId?: string;
+
+  @ApiPropertyOptional({ type: [AttachmentDto], description: 'Optional screenshots or proof documents' })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => AttachmentDto)
+  attachments?: AttachmentDto[];
+
+  @ApiPropertyOptional({ example: 'receipt.pdf' })
+  @IsOptional()
+  @IsString()
+  attachmentName?: string;
+
+  @ApiPropertyOptional({ example: 'application/pdf' })
+  @IsOptional()
+  @IsString()
+  attachmentType?: string;
+
+  @ApiPropertyOptional({ description: 'Base64 data or data URL' })
+  @IsOptional()
+  @IsString()
+  attachmentData?: string;
 }
 
 export class UpdateTicketStatusDto {

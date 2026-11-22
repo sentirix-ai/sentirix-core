@@ -1,5 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsArray, IsEnum, IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsArray, IsEnum, IsNotEmpty, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
+import { AttachmentDto } from './attachment.dto.js';
 
 export class ChatMessageDto {
   @ApiProperty({ example: 'Customer' })
@@ -35,6 +37,13 @@ export class DraftReplyDto {
   @IsOptional()
   @IsString()
   knowledgeContext?: string;
+
+  @ApiPropertyOptional({ type: [AttachmentDto], description: 'Visual evidence (screenshots or proof documents)' })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => AttachmentDto)
+  attachments?: AttachmentDto[];
 }
 
 export class DraftReplyResponseDto {

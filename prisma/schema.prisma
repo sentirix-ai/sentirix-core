@@ -127,6 +127,9 @@ model Ticket {
   updatedAt       DateTime     @updatedAt
   customerName    String?
   workspaceId     String?
+  attachmentName  String?
+  attachmentType  String?
+  attachmentData  String?
   auditLogs       AuditLog[]
   messages        Message[]
   assignedAgent   User?        @relation("AgentTickets", fields: [assignedAgentId], references: [id])
@@ -145,9 +148,12 @@ model Message {
   ticketId    String
   senderId    String
   type        MessageType @default(PUBLIC_REPLY)
-  content     String
-  aiGenerated Boolean     @default(false)
-  createdAt   DateTime    @default(now())
+  content        String
+  aiGenerated    Boolean     @default(false)
+  attachmentName String?
+  attachmentType String?
+  attachmentData String?
+  createdAt      DateTime    @default(now())
   sender      User        @relation(fields: [senderId], references: [id])
   ticket      Ticket      @relation(fields: [ticketId], references: [id], onDelete: Cascade)
 

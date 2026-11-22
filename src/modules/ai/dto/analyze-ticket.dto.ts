@@ -1,5 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsArray, IsNotEmpty, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
+import { AttachmentDto } from './attachment.dto.js';
 
 export class AnalyzeTicketDto {
   @ApiProperty({ example: 'Cannot access billing invoice and payment failed twice' })
@@ -19,6 +21,13 @@ export class AnalyzeTicketDto {
   @IsOptional()
   @IsString()
   industry?: string;
+
+  @ApiPropertyOptional({ type: [AttachmentDto], description: 'Visual evidence (screenshots or proof documents)' })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => AttachmentDto)
+  attachments?: AttachmentDto[];
 }
 
 export class AnalyzeTicketResponseDto {

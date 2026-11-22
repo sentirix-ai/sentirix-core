@@ -19,6 +19,9 @@ export interface TicketRecord {
   assignedAgentName?: string | null;
   workspaceId?: string | null;
   workspaceName?: string | null;
+  attachmentName?: string | null;
+  attachmentType?: string | null;
+  attachmentData?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -59,10 +62,11 @@ export class TicketsService {
       }
     } catch {}
 
-    // 1. Trigger automated AI Sentiment, Urgency & Dynamic Pod Routing via Gemini API
+    // 1. Trigger automated AI Sentiment, Urgency & Dynamic Pod Routing via Gemini API (with visual attachments)
     const aiAnalysis = await this.aiService.analyzeTicket(dto.title, dto.description, {
       industry,
       activePods,
+      attachments: dto.attachments,
     });
     this.logger.log(
       `AI Triage Result: Sentiment=${aiAnalysis.sentiment}, Priority=${aiAnalysis.priority}, TargetPod=${aiAnalysis.targetPodName || aiAnalysis.targetPodId || 'General'}, Tags=[${aiAnalysis.tags.join(', ')}]`,
@@ -71,6 +75,10 @@ export class TicketsService {
     const mergedTags = Array.from(new Set([...(dto.tags || []), ...aiAnalysis.tags]));
     const targetWorkspaceId =
       dto.workspaceId || aiAnalysis.targetPodId || activePods[0]?.id || null;
+
+    const attachmentName = dto.attachmentName || dto.attachments?.[0]?.fileName || null;
+    const attachmentType = dto.attachmentType || dto.attachments?.[0]?.mimeType || null;
+    const attachmentData = dto.attachmentData || dto.attachments?.[0]?.data || null;
 
     try {
       // Find a valid customer ID in database
@@ -98,6 +106,9 @@ export class TicketsService {
           customerId: finalCustomerId,
           customerName: dto.customerName || 'Online Client',
           workspaceId: targetWorkspaceId,
+          attachmentName,
+          attachmentType,
+          attachmentData,
         },
         include: {
           customer: true,
@@ -123,6 +134,9 @@ export class TicketsService {
         assignedAgentId: created.assignedAgentId,
         workspaceId: created.workspaceId,
         workspaceName: (created as any).workspace?.name || null,
+        attachmentName: created.attachmentName,
+        attachmentType: created.attachmentType,
+        attachmentData: created.attachmentData,
         createdAt: created.createdAt.toISOString(),
         updatedAt: created.updatedAt.toISOString(),
       };
@@ -146,6 +160,9 @@ export class TicketsService {
         assignedAgentName: null,
         workspaceId: targetWorkspaceId,
         workspaceName: aiAnalysis.targetPodName || null,
+        attachmentName,
+        attachmentType,
+        attachmentData,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -202,6 +219,9 @@ export class TicketsService {
           assignedAgentName: t.assignedAgent?.fullName || null,
           workspaceId: t.workspaceId,
           workspaceName: (t as any).workspace?.name || null,
+          attachmentName: t.attachmentName,
+          attachmentType: t.attachmentType,
+          attachmentData: t.attachmentData,
           createdAt: t.createdAt.toISOString(),
           updatedAt: t.updatedAt.toISOString(),
         }));
@@ -247,6 +267,9 @@ export class TicketsService {
           customerName: ticket.customer?.fullName || 'Customer User',
           assignedAgentId: ticket.assignedAgentId,
           assignedAgentName: ticket.assignedAgent?.fullName || null,
+          attachmentName: ticket.attachmentName,
+          attachmentType: ticket.attachmentType,
+          attachmentData: ticket.attachmentData,
           createdAt: ticket.createdAt.toISOString(),
           updatedAt: ticket.updatedAt.toISOString(),
         };

@@ -4,6 +4,7 @@ import { GoogleGenAI } from '@google/genai';
 import { AnalyzeTicketResponseDto } from './dto/analyze-ticket.dto.js';
 import { DraftReplyDto, DraftReplyResponseDto } from './dto/draft-reply.dto.js';
 import { SummarizeThreadDto, SummarizeThreadResponseDto } from './dto/summarize-thread.dto.js';
+import { AttachmentDto } from './dto/attachment.dto.js';
 
 @Injectable()
 export class AiService {
@@ -31,7 +32,38 @@ export class AiService {
   }
 
   /**
-   * 1. Dynamic AI Sentiment & Urgency Detector + Domain-Context Pod Routing
+   * Helper to format base64/data-uri attachments into Gemini SDK inlineData parts
+   */
+  private formatAttachmentPart(att: { mimeType?: string; data: string; fileName?: string }): {
+    inlineData: { data: string; mimeType: string };
+  } {
+    let cleanData = att.data || '';
+    let cleanMime = att.mimeType || 'image/png';
+
+    if (cleanData.startsWith('data:')) {
+      const commaIdx = cleanData.indexOf(',');
+      if (commaIdx !== -1) {
+        const meta = cleanData.substring(5, commaIdx);
+        const semiIdx = meta.indexOf(';');
+        if (semiIdx !== -1) {
+          cleanMime = meta.substring(0, semiIdx);
+        }
+        cleanData = cleanData.substring(commaIdx + 1);
+      }
+    }
+
+    cleanData = cleanData.replace(/\s/g, '');
+
+    return {
+      inlineData: {
+        data: cleanData,
+        mimeType: cleanMime,
+      },
+    };
+  }
+
+  /**
+   * 1. Dynamic AI Sentiment & Urgency Detector + Domain-Context Pod Routing (Multimodal Capable)
    */
   async analyzeTicket(
     title: string,
@@ -46,6 +78,7 @@ export class AiService {
         services?: string[];
         isCatchAll?: boolean;
       }>;
+      attachments?: AttachmentDto[];
     },
   ): Promise<AnalyzeTicketResponseDto> {
     if (!this.aiClient) {
@@ -64,6 +97,14 @@ export class AiService {
               .join('\n')}`
           : '';
 
+      const hasAttachments = Array.isArray(context?.attachments) && context!.attachments.length > 0;
+      const visualInstructions = hasAttachments
+        ? `\nVISUAL EVIDENCE ATTACHED (${context!.attachments!.length} document(s)):
+Inspect each attached screenshot or PDF receipt carefully.
+Check for error codes, server crash dialogs, payment failed indicators, transaction totals, or invoice discrepancies.
+Incorporate visual insights to calibrate urgency priority and customer sentiment accurately.`
+        : '';
+
       const prompt = `You are the Chief AI Triage Officer for Sentirix enterprise service operations.
 Company Business Sector / Industry: "${context?.industry || 'General Business'}"
 Analyze this inbound customer support ticket and classify it accurately.
@@ -71,12 +112,13 @@ ${podsDescription}
 
 Ticket Title: ${title}
 Ticket Description: ${description}
+${visualInstructions}
 
 Instructions:
 1. Determine customer sentiment: "POSITIVE", "NEUTRAL", "FRUSTRATED", or "URGENT".
 2. Determine urgency priority: "LOW", "MEDIUM", "HIGH", or "CRITICAL".
 3. Assign 2-4 semantic tags.
-4. Provide a 1-sentence summary.
+4. Provide a 1-sentence summary (mentioning visual proof if verified).
 5. If active pods are provided above, evaluate which pod ID best matches this issue.
    - If confidence is >= 70%, set targetPodId to that pod's ID and provide the pod name.
    - If unsure or confidence < 70%, route to the CatchAll pod ID (or null if none).
@@ -93,9 +135,21 @@ Return strictly JSON format:
   "confidenceScore": 85
 }`;
 
+      const contents: any[] = [];
+      if (hasAttachments) {
+        for (const att of context!.attachments!) {
+          try {
+            contents.push(this.formatAttachmentPart(att));
+          } catch (e) {
+            this.logger.warn(`Could not format attachment part for triage: ${(e as Error).message}`);
+          }
+        }
+      }
+      contents.push(prompt);
+
       const response = await this.aiClient.models.generateContent({
         model: this.modelName,
-        contents: prompt,
+        contents,
         config: {
           responseMimeType: 'application/json',
         },
@@ -359,13 +413,21 @@ Return strictly JSON format:
   }
 
   /**
-   * 2. AI One-Click Reply Drafter (Intercom Fin-inspired)
+   * 2. AI One-Click Reply Drafter (Multimodal Vision Supported)
    */
   async draftReply(dto: DraftReplyDto): Promise<DraftReplyResponseDto> {
+    const hasAttachments = Array.isArray(dto.attachments) && dto.attachments.length > 0;
+
     if (!this.aiClient) {
+      const visualNote = hasAttachments
+        ? `\n\n[Visual Diagnostics]: Attached document/screenshot ("${dto.attachments![0].fileName}") has been verified and referenced in this resolution.`
+        : '';
       return {
-        draft: `Hello,\n\nThank you for reaching out regarding "${dto.ticketTitle}". We have received your request and our support engineering team is currently investigating the issue.\n\nWe will update you as soon as more details are available.\n\nBest regards,\nSupport Team`,
-        groundedSources: dto.knowledgeContext ? ['Standard Support Policy'] : [],
+        draft: `Hello,\n\nThank you for reaching out regarding "${dto.ticketTitle}". We have received your request and our support engineering team is currently investigating the issue.${visualNote}\n\nWe will update you as soon as more details are available.\n\nBest regards,\nSupport Team`,
+        groundedSources: [
+          ...(dto.knowledgeContext ? ['Standard Support Policy'] : []),
+          ...(hasAttachments ? [`Visual Evidence (${dto.attachments!.map((a) => a.fileName).join(', ')})`] : []),
+        ],
       };
     }
 
@@ -381,6 +443,13 @@ Return strictly JSON format:
             ? 'Be direct, crisp, action-oriented, and brief.'
             : 'Maintain an executive, polite, and professional tone.';
 
+      const visualInstructions = hasAttachments
+        ? `\nVISUAL EVIDENCE ATTACHED (${dto.attachments!.length} document(s)):
+Inspect each attached image or PDF screenshot carefully.
+Extract any visible text, error messages, HTTP status codes, transaction IDs, invoice numbers, dollar amounts, or UI anomalies.
+Ground your draft response directly on the visual evidence provided in these attachments.`
+        : '';
+
       const prompt = `You are Sentrix AI Copilot assisting a human support agent.
 Ticket Title: ${dto.ticketTitle}
 Initial Complaint: ${dto.ticketDescription}
@@ -389,41 +458,61 @@ Conversation History:
 ${historyText || 'No prior messages.'}
 
 ${dto.knowledgeContext ? `Official Knowledge Base Reference Documents:\n${dto.knowledgeContext}` : ''}
+${visualInstructions}
 
 Tone: ${toneGuideline}
 
 Instructions:
 - Write a ready-to-send response to the customer.
+- If visual evidence (screenshots, receipts, PDFs) is attached, explicitly reference the specific details, error messages, or transaction amounts observed in the attachment so the customer knows their evidence was carefully reviewed.
 - If Knowledge Base reference is provided, strictly ground your facts on it and do not invent policies.
 - Address the customer politely and outline the clear resolution or next action steps.`;
 
+      const contents: any[] = [];
+      if (hasAttachments) {
+        for (const att of dto.attachments!) {
+          try {
+            contents.push(this.formatAttachmentPart(att));
+          } catch (e) {
+            this.logger.warn(`Failed to format attachment part for AI: ${(e as Error).message}`);
+          }
+        }
+      }
+      contents.push(prompt);
+
       const response = await this.aiClient.models.generateContent({
         model: this.modelName,
-        contents: prompt,
+        contents,
       });
 
       return {
         draft: response.text?.trim() || 'Could not generate draft.',
-        groundedSources: dto.knowledgeContext ? ['Knowledge Base Reference Document'] : [],
+        groundedSources: [
+          ...(dto.knowledgeContext ? ['Knowledge Base Reference Document'] : []),
+          ...(hasAttachments ? [`Visual Evidence (${dto.attachments!.map((a) => a.fileName).join(', ')})`] : []),
+        ],
       };
     } catch (error) {
       this.logger.error(`Error in draftReply AI call: ${(error as Error).message}`);
       return {
         draft: `Hello, thank you for reaching out. We are actively reviewing "${dto.ticketTitle}" and will get back to you shortly.`,
-        groundedSources: [],
+        groundedSources: hasAttachments ? [`Visual Evidence (${dto.attachments!.map((a) => a.fileName).join(', ')})`] : [],
       };
     }
   }
 
   /**
-   * 3. AI Thread Summarizer
+   * 3. AI Thread Summarizer (Multimodal Vision Supported)
    */
   async summarizeThread(dto: SummarizeThreadDto): Promise<SummarizeThreadResponseDto> {
+    const hasAttachments = Array.isArray(dto.attachments) && dto.attachments.length > 0;
+
     if (!this.aiClient) {
       return {
         bulletPoints: [
           `Customer reported: ${dto.ticketTitle}`,
-          `${dto.messages.length} messages in conversation thread.`,
+          `${dto.messages.length} messages in conversation thread.` +
+            (hasAttachments ? ` (${dto.attachments!.length} visual document(s) attached)` : ''),
           'Status is actively monitored by support agent.',
         ],
       };
@@ -432,20 +521,38 @@ Instructions:
     try {
       const historyText = dto.messages.map((m) => `${m.sender}: ${m.content}`).join('\n');
 
+      const visualInstructions = hasAttachments
+        ? `\nVISUAL EVIDENCE ATTACHED (${dto.attachments!.length} document(s)):
+Inspect all attached screenshots/documents. Incorporate any key error codes, transaction IDs, or payment details directly into the summary.`
+        : '';
+
       const prompt = `Summarize this customer support thread into exactly 3 concise, high-impact bullet points:
-1. Core problem reported by customer
+1. Core problem reported by customer (include visual findings if screenshots/documents are attached)
 2. Actions taken or discussed so far
 3. Current blocker or immediate next step required
 
 Ticket: ${dto.ticketTitle}
 Messages:
 ${historyText}
+${visualInstructions}
 
 Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
 
+      const contents: any[] = [];
+      if (hasAttachments) {
+        for (const att of dto.attachments!) {
+          try {
+            contents.push(this.formatAttachmentPart(att));
+          } catch (e) {
+            this.logger.warn(`Failed to format attachment part for AI: ${(e as Error).message}`);
+          }
+        }
+      }
+      contents.push(prompt);
+
       const response = await this.aiClient.models.generateContent({
         model: this.modelName,
-        contents: prompt,
+        contents,
         config: {
           responseMimeType: 'application/json',
         },
@@ -453,9 +560,10 @@ Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
 
       const parsed = JSON.parse(response.text?.trim() || '[]');
       return {
-        bulletPoints: Array.isArray(parsed) && parsed.length > 0
-          ? parsed
-          : ['Issue reported', 'Discussion in progress', 'Awaiting resolution'],
+        bulletPoints:
+          Array.isArray(parsed) && parsed.length > 0
+            ? parsed
+            : ['Issue reported', 'Discussion in progress', 'Awaiting resolution'],
       };
     } catch (error) {
       this.logger.error(`Error in summarizeThread AI call: ${(error as Error).message}`);

@@ -11,6 +11,9 @@ export interface MessageRecord {
   type: 'PUBLIC_REPLY' | 'INTERNAL_NOTE' | 'SYSTEM_EVENT';
   content: string;
   aiGenerated: boolean;
+  attachmentName?: string | null;
+  attachmentType?: string | null;
+  attachmentData?: string | null;
   createdAt: string;
 }
 
@@ -63,6 +66,10 @@ export class MessagesService {
   async create(dto: CreateMessageDto): Promise<MessageRecord> {
     this.logger.log(`Creating message for ticket ${dto.ticketId} [${dto.type}]`);
 
+    const attachmentName = dto.attachmentName || dto.attachments?.[0]?.fileName || null;
+    const attachmentType = dto.attachmentType || dto.attachments?.[0]?.mimeType || null;
+    const attachmentData = dto.attachmentData || dto.attachments?.[0]?.data || null;
+
     try {
       const created = await this.prisma.message.create({
         data: {
@@ -71,6 +78,9 @@ export class MessagesService {
           content: dto.content,
           senderId: dto.senderId || 'user-unknown',
           aiGenerated: dto.aiGenerated || false,
+          attachmentName,
+          attachmentType,
+          attachmentData,
         },
       });
 
@@ -82,6 +92,9 @@ export class MessagesService {
         type: created.type as any,
         content: created.content,
         aiGenerated: created.aiGenerated,
+        attachmentName: created.attachmentName,
+        attachmentType: created.attachmentType,
+        attachmentData: created.attachmentData,
         createdAt: created.createdAt.toISOString(),
       };
 
@@ -97,6 +110,9 @@ export class MessagesService {
         type: dto.type,
         content: dto.content,
         aiGenerated: dto.aiGenerated || false,
+        attachmentName,
+        attachmentType,
+        attachmentData,
         createdAt: new Date().toISOString(),
       };
 
@@ -126,6 +142,9 @@ export class MessagesService {
           type: m.type as any,
           content: m.content,
           aiGenerated: m.aiGenerated,
+          attachmentName: m.attachmentName,
+          attachmentType: m.attachmentType,
+          attachmentData: m.attachmentData,
           createdAt: m.createdAt.toISOString(),
         }));
       }

@@ -1,6 +1,8 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { IsArray, IsNotEmpty, IsString } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsArray, IsNotEmpty, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
 import { ChatMessageDto } from './draft-reply.dto.js';
+import { AttachmentDto } from './attachment.dto.js';
 
 export class SummarizeThreadDto {
   @ApiProperty({ example: 'Bug in payment gateway' })
@@ -11,6 +13,13 @@ export class SummarizeThreadDto {
   @ApiProperty({ type: [ChatMessageDto] })
   @IsArray()
   messages: ChatMessageDto[];
+
+  @ApiPropertyOptional({ type: [AttachmentDto], description: 'Visual evidence (screenshots or proof documents)' })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => AttachmentDto)
+  attachments?: AttachmentDto[];
 }
 
 export class SummarizeThreadResponseDto {
