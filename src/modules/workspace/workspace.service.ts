@@ -71,6 +71,13 @@ function formatCorporateTitleCase(input: string): string {
 export class WorkspaceService {
   private readonly logger = new Logger(WorkspaceService.name);
 
+  /**
+   * Sanitizes token strings, stripping whitespace and trailing punctuation (e.g. from chat copy/paste)
+   */
+  private sanitizeToken(raw?: string | null): string {
+    return (raw || '').trim().replace(/[.,;:!?/\\'"]+$/, '').trim();
+  }
+
   // First-Open Browser Session Lock: Only 1 browser session can open and claim each single-use token
   private tokenOpenSessionLocks = new Map<
     string,
@@ -435,7 +442,7 @@ export class WorkspaceService {
       throw new BadRequestException('Invite token is required.');
     }
 
-    const cleanToken = token.trim();
+    const cleanToken = this.sanitizeToken(token);
 
     // Check in single-use tokens table first
     const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
@@ -541,7 +548,7 @@ export class WorkspaceService {
    */
   async joinWorkspace(dto: JoinWorkspaceDto) {
     const { token, fullName } = dto;
-    const cleanToken = token.trim();
+    const cleanToken = this.sanitizeToken(token);
     const cleanName = fullName.trim();
 
     if (!cleanName || cleanName.length < 2) {
@@ -1538,7 +1545,7 @@ export class WorkspaceService {
     if (!token || token.trim() === '') {
       throw new BadRequestException('Token is required.');
     }
-    const cleanToken = token.trim();
+    const cleanToken = this.sanitizeToken(token);
 
     const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
       where: { token: cleanToken },
@@ -1579,12 +1586,21 @@ export class WorkspaceService {
     const activeLeaderMember = currentWorkspace?.members?.find(
       (m: any) => m.role === 'LEADER',
     );
-    const isExistingLeader = !!activeLeaderMember || !!tokenRecord.usedBy;
     const existingLeaderName =
       activeLeaderMember?.user?.fullName ||
       activeLeaderMember?.user?.username ||
       tokenRecord.usedBy ||
       null;
+
+    // Strict Single-Leader Enforcement: If the Pod ALREADY has an active Leader, reject duplicate activation
+    if (activeLeaderMember) {
+      return {
+        valid: false,
+        isClaimed: true,
+        error: `This invitation is no longer active because ${existingLeaderName || 'an assigned Leader'} has already assumed leadership for ${currentWorkspace.name}. Under organizational governance policy, each operational pod maintains exactly one Team Lead seat. Please sign in with your corporate credentials.`,
+        workspaceName: currentWorkspace.name,
+      };
+    }
 
     if (tokenRecord.isUsed) {
       return {
@@ -1659,29 +1675,31 @@ export class WorkspaceService {
       const currentSubordinates = Math.max(1, currentWorkspace.assignedQuota - 1);
       maxSubordinatesAllowed = currentSubordinates;
       allowedOptions = [currentSubordinates];
-    } else if (isLastPod) {
+    } else if (isLastPod || otherUnlockedPodsCount === 0) {
       // Final pod to lock quota: receives the exact remainder of the organization seats
       // Hard cap: maximum 8 seats (1 Leader + 7 Agents)
       // Hard floor: minimum 2 seats (1 Leader + 1 Agent)
       const remainingOrgSeats = totalSeats - lockedSeats;
-      const exactSeats = Math.min(8, Math.max(2, remainingOrgSeats));
-      const exactSubordinates = exactSeats - 1;
+      const exactSeats = Math.min(8, Math.max(totalSeats === 1 ? 1 : 2, remainingOrgSeats));
+      const exactSubordinates = Math.max(0, exactSeats - 1);
       maxSubordinatesAllowed = exactSubordinates;
       // Dropdown contains only the exact remaining seats
       allowedOptions = [exactSubordinates];
     } else {
-      // Not the last pod: reserve at least 2 seats (1 leader + 1 member) for every other unlocked pod
-      const reservedSeatsForOthers = otherUnlockedPodsCount * 2;
-      const availableSeatsForThisPod = totalSeats - lockedSeats - reservedSeatsForOthers;
-      // Hard cap: maximum 8 seats (1 Leader + 7 Agents)
-      // Hard floor: minimum 2 seats (1 Leader + 1 Agent)
-      const maxAllowedSeats = Math.min(8, Math.max(2, availableSeatsForThisPod));
-      const maxSubs = maxAllowedSeats - 1;
+      // Two-Sided Bounded Allocation (Guarantees all pods mathematically stay between 2 and 8 seats):
+      const remainingSeats = totalSeats - lockedSeats;
+      // Lower bound: ensures remaining unlocked pods do not exceed max 8 seats
+      const minSeats = Math.max(2, remainingSeats - (otherUnlockedPodsCount * 8));
+      // Upper bound: ensures remaining unlocked pods receive at least min 2 seats (1 leader + 1 agent)
+      const maxSeats = Math.min(8, remainingSeats - (otherUnlockedPodsCount * 2));
+
+      const minSubs = Math.max(1, minSeats - 1);
+      const maxSubs = Math.max(minSubs, maxSeats - 1);
       maxSubordinatesAllowed = maxSubs;
-      allowedOptions = Array.from(
-        { length: maxSubordinatesAllowed },
-        (_, i) => i + 1,
-      );
+      allowedOptions = [];
+      for (let s = minSubs; s <= maxSubs; s++) {
+        allowedOptions.push(s);
+      }
     }
 
     // If pod is quota locked, fetch its agent tokens so frontend can restore activation view on refresh
@@ -1715,16 +1733,9 @@ export class WorkspaceService {
       valid: true,
       token: tokenRecord.token,
       role: 'LEADER',
-      isExistingLeader,
-      existingLeaderName,
-      leaderUser: activeLeaderMember?.user
-        ? {
-            id: activeLeaderMember.user.id,
-            username: activeLeaderMember.user.username,
-            fullName: activeLeaderMember.user.fullName,
-            email: activeLeaderMember.user.email,
-          }
-        : null,
+      isExistingLeader: false,
+      existingLeaderName: null,
+      leaderUser: null,
       agentTokens: agentTokensList,
       workspace: {
         id: currentWorkspace.id,
@@ -1766,7 +1777,7 @@ export class WorkspaceService {
     if (!token) {
       throw new BadRequestException('Token is required.');
     }
-    const cleanToken = token.trim();
+    const cleanToken = this.sanitizeToken(token);
 
     const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
       where: { token: cleanToken },
@@ -1805,16 +1816,17 @@ export class WorkspaceService {
       const isLastPod = otherUnlockedPodsCount === 0 && otherLockedPods.length > 0;
       let safeSubordinates: number;
 
-      if (isLastPod) {
+      if (isLastPod || otherUnlockedPodsCount === 0) {
         const remainingSeats = (organization.totalSeats || 20) - lockedSeats;
-        const exactSeats = Math.min(8, Math.max(2, remainingSeats));
-        safeSubordinates = exactSeats - 1;
+        const exactSeats = Math.min(8, Math.max(organization.totalSeats === 1 ? 1 : 2, remainingSeats));
+        safeSubordinates = Math.max(0, exactSeats - 1);
       } else {
-        const reservedForOthers = otherUnlockedPodsCount * 2;
-        const availableSeats = (organization.totalSeats || 20) - lockedSeats - reservedForOthers;
-        const maxAllowedSeats = Math.min(8, Math.max(2, availableSeats));
-        const maxSubs = maxAllowedSeats - 1;
-        safeSubordinates = Math.min(Math.max(1, Number(chosenSubordinates) || 1), maxSubs);
+        const remainingSeats = (organization.totalSeats || 20) - lockedSeats;
+        const minSeats = Math.max(2, remainingSeats - (otherUnlockedPodsCount * 8));
+        const maxSeats = Math.min(8, remainingSeats - (otherUnlockedPodsCount * 2));
+        const minSubs = Math.max(1, minSeats - 1);
+        const maxSubs = Math.max(minSubs, maxSeats - 1);
+        safeSubordinates = Math.min(Math.max(minSubs, Number(chosenSubordinates) || minSubs), maxSubs);
       }
 
       const totalPodQuota = 1 + safeSubordinates;
@@ -1884,7 +1896,7 @@ export class WorkspaceService {
     if (!token || !fullName || fullName.trim().length < 2) {
       throw new BadRequestException('Please provide a valid token and full name.');
     }
-    const cleanToken = token.trim();
+    const cleanToken = this.sanitizeToken(token);
     const cleanName = fullName.trim();
     const chosenCount = Number(chosenSubordinates) || 1;
 
@@ -1928,95 +1940,15 @@ export class WorkspaceService {
 
     const workspace = tokenRecord.workspace;
 
-    // Check if Pod ALREADY has a registered Leader (e.g. Meta, Tita re-logging in via regenerated token)
+    // Strict Single-Leader Enforcement: If Pod ALREADY has an active Leader, reject duplicate activation
     const existingLeaderMember = workspace.members.find(
       (m: any) => m.role === 'LEADER',
     );
 
     if (existingLeaderMember && existingLeaderMember.user) {
-      const leaderUser = existingLeaderMember.user;
-
-      if (password && password.trim() !== '') {
-        const passwordHash = crypto
-          .createHash('sha256')
-          .update(password.trim())
-          .digest('hex');
-        await this.prisma.user.update({
-          where: { id: leaderUser.id },
-          data: { passwordHash },
-        });
-      }
-
-      // Mark single-use token as consumed upon successful login
-      await this.prisma.workspaceInviteToken.update({
-        where: { id: tokenRecord.id },
-        data: {
-          isUsed: true,
-          usedBy: leaderUser.fullName || leaderUser.username,
-          usedAt: new Date(),
-        },
-      });
-
-      // Start presence activity session
-      try {
-        await this.prisma.userActivitySession.updateMany({
-          where: { userId: leaderUser.id, isOnline: true },
-          data: {
-            isOnline: false,
-            logoutAt: new Date(),
-            logoutReason: 'SESI_BARU_DIMULAI',
-          },
-        });
-
-        await this.prisma.userActivitySession.create({
-          data: {
-            userId: leaderUser.id,
-            organizationId: workspace.organizationId,
-            workspaceId: workspace.id,
-            role: 'LEADER',
-            loginAt: new Date(),
-            lastHeartbeatAt: new Date(),
-            isOnline: true,
-          },
-        });
-      } catch (err) {
-        this.logger.warn(`Could not start leader activity session: ${(err as Error)?.message}`);
-      }
-
-      // Fetch all agent tokens in this pod for the leader dashboard
-      const agentTokens = await this.prisma.workspaceInviteToken.findMany({
-        where: { workspaceId: workspace.id, role: 'AGENT' },
-        select: { token: true },
-      });
-
-      this.logger.log(
-        `Leader ${leaderUser.fullName} (@${leaderUser.username}) re-logged into Pod "${workspace.name}" via token ${cleanToken}.`,
+      throw new BadRequestException(
+        `Leadership seat for ${workspace.name} is already occupied by ${existingLeaderMember.user.fullName || existingLeaderMember.user.username}. Under organizational governance policy, each pod maintains exactly one active Team Lead.`,
       );
-
-      return {
-        success: true,
-        isReLogin: true,
-        leader: {
-          id: leaderUser.id,
-          username: leaderUser.username,
-          fullName: leaderUser.fullName,
-          email: leaderUser.email,
-          role: 'LEADER',
-          workspaceRole: 'LEADER',
-          avatarText: (leaderUser.fullName || leaderUser.username || 'LD').slice(0, 2).toUpperCase(),
-          workspaceId: workspace.id,
-        },
-        workspace: {
-          id: workspace.id,
-          name: workspace.name,
-          assignedQuota: workspace.assignedQuota,
-          isQuotaLocked: true,
-        },
-        agentTokens: agentTokens.map((t) => ({
-          token: t.token,
-          joinUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/join?token=${t.token}`,
-        })),
-      };
     }
 
     const maxAllowed = quotaStatus.quotaStats.maxSubordinatesAllowed;
@@ -2238,7 +2170,7 @@ export class WorkspaceService {
     if (!token || token.trim() === '') {
       throw new BadRequestException('Token is required.');
     }
-    const cleanToken = token.trim();
+    const cleanToken = this.sanitizeToken(token);
 
     const tokenRecord = await this.prisma.workspaceInviteToken.findUnique({
       where: { token: cleanToken },
@@ -2349,7 +2281,7 @@ export class WorkspaceService {
     if (!token || !fullName || fullName.trim().length < 2) {
       throw new BadRequestException('Please provide a valid token and full name.');
     }
-    const cleanToken = token.trim();
+    const cleanToken = this.sanitizeToken(token);
     const cleanName = fullName.trim();
 
     // Verify First-Open Browser Session Lock
@@ -3193,7 +3125,7 @@ export class WorkspaceService {
     requesterIdentifier?: string,
     workspaceId?: string,
   ) {
-    const cleanToken = (oldToken || '').trim();
+    const cleanToken = this.sanitizeToken(oldToken);
 
     let tokenRecord = cleanToken
       ? await this.prisma.workspaceInviteToken.findUnique({
@@ -3257,12 +3189,14 @@ export class WorkspaceService {
         where: { workspaceId: tokenRecord.workspaceId, role: 'LEADER' },
         include: { user: true },
       });
-      isAlreadyClaimed = !!activeLeaderMember || tokenRecord.isUsed;
-      retainedUsedBy =
-        activeLeaderMember?.user?.fullName ||
-        activeLeaderMember?.user?.username ||
-        tokenRecord.usedBy;
-      retainedUsedAt = tokenRecord.usedAt || activeLeaderMember?.joinedAt || new Date();
+      if (activeLeaderMember) {
+        throw new BadRequestException(
+          `Leadership seat for "${tokenRecord.workspace.name}" is already assigned to ${activeLeaderMember.user?.fullName || activeLeaderMember.user?.username}. Under organizational governance policy, each pod maintains exactly one Team Lead. To rotate or reassign pod leadership, manage members in the Admin Cockpit.`,
+        );
+      }
+      isAlreadyClaimed = tokenRecord.isUsed;
+      retainedUsedBy = tokenRecord.usedBy;
+      retainedUsedAt = tokenRecord.usedAt || new Date();
     } else {
       // For AGENT member:
       // If token was already used or had an assigned user, preserve their activated status and name
@@ -3364,6 +3298,7 @@ export class WorkspaceService {
             workspaces: {
               include: {
                 inviteTokens: { orderBy: { createdAt: 'desc' } },
+                members: { include: { user: true } },
               },
               orderBy: { createdAt: 'asc' },
             },
@@ -3387,9 +3322,10 @@ export class WorkspaceService {
     const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
 
     for (const ws of user.organization.workspaces || []) {
+      const activeLeader = ws.members?.find((m: any) => m.role === 'LEADER');
       const leaderTok = ws.inviteTokens?.find((t) => t.role === 'LEADER') || {
         token: ws.inviteToken,
-        isUsed: false,
+        isUsed: !!activeLeader,
       };
       if (leaderTok?.token) {
         leaderTokens.push({
@@ -3399,8 +3335,13 @@ export class WorkspaceService {
           services: ws.services || [],
           token: leaderTok.token,
           role: 'LEADER',
-          isUsed: leaderTok.isUsed ?? false,
+          isUsed: !!activeLeader || (leaderTok.isUsed ?? false),
           joinUrl: `${baseUrl}/join?token=${leaderTok.token}`,
+          isClaimed: !!activeLeader,
+          leaderName:
+            activeLeader?.user?.fullName ||
+            activeLeader?.user?.username ||
+            null,
         });
       }
 
