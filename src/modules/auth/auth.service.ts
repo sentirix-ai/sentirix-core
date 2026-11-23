@@ -9,6 +9,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { EventsGateway } from '../events/events.gateway.js';
 import { RegisterDto } from './dto/register.dto.js';
 import { LoginDto } from './dto/login.dto.js';
 import { UpdateAvatarDto } from './dto/update-avatar.dto.js';
@@ -67,7 +68,10 @@ export class AuthService implements OnModuleInit {
     },
   ];
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly eventsGateway: EventsGateway,
+  ) {}
 
   async onModuleInit() {
     try {
@@ -243,14 +247,100 @@ export class AuthService implements OnModuleInit {
    */
   async logoutSession(userId: string, reason = 'MANUAL_LOGOUT') {
     try {
+      if (!userId) return { success: true };
+
+      // Resolve user by id, username, or fullName for resilient multi-format identifiers
+      const user = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { id: userId },
+            { username: { equals: userId, mode: 'insensitive' } },
+            { fullName: { equals: userId, mode: 'insensitive' } },
+          ],
+        },
+      });
+
+      const effectiveUserId = user ? user.id : userId;
+      const effectiveName = user?.fullName || user?.username || userId;
+
       await this.prisma.userActivitySession.updateMany({
-        where: { userId, isOnline: true },
+        where: { userId: effectiveUserId, isOnline: true },
         data: {
           isOnline: false,
           logoutAt: new Date(),
           logoutReason: reason,
         },
       });
+
+      this.logger.log(`User session terminated for ${effectiveName} (${effectiveUserId}) with reason: ${reason}`);
+
+      // Automated Hanging Ticket Radar Guard: Flag unresolved tickets held by this departing staff
+      try {
+        const hangingReason =
+          reason === 'MANUAL_LOGOUT'
+            ? 'AGENT_LOGOUT_BEFORE_RESOLVED'
+            : reason === 'BROWSER_CLOSE' || reason === 'ABRUPT_DISCONNECT'
+            ? 'AGENT_ABRUPT_DISCONNECT'
+            : `AGENT_DISCONNECTED_${reason}`;
+
+        const hangingTickets = await this.prisma.ticket.findMany({
+          where: {
+            assignedAgentId: effectiveUserId,
+            status: { in: ['NEW', 'OPEN', 'PENDING'] },
+            isHanging: false,
+          },
+        });
+
+        if (hangingTickets.length > 0) {
+          const now = new Date();
+          await this.prisma.ticket.updateMany({
+            where: {
+              id: { in: hangingTickets.map((t) => t.id) },
+            },
+            data: {
+              isHanging: true,
+              hangingReason,
+              hangingSince: now,
+            },
+          });
+
+          this.logger.warn(
+            `Automated Hanging Radar: Flagged ${hangingTickets.length} tickets as hanging due to ${reason} by ${effectiveName}`,
+          );
+
+          for (const t of hangingTickets) {
+            this.eventsGateway.broadcastTicketUpdated({
+              ...t,
+              isHanging: true,
+              hangingReason,
+              hangingSince: now.toISOString(),
+            });
+          }
+        }
+      } catch (hangingErr) {
+        this.logger.warn(`Could not flag hanging tickets: ${(hangingErr as Error)?.message}`);
+      }
+
+      // Broadcast instant WebSocket presence notification to Cockpit & connected admin hubs
+      try {
+        this.eventsGateway.server?.emit('presence:changed', {
+          userId: effectiveUserId,
+          username: user?.username || userId,
+          fullName: user?.fullName || userId,
+          isOnline: false,
+          reason,
+          timestamp: new Date().toISOString(),
+        });
+        this.eventsGateway.server?.emit('team:member_left', {
+          memberId: effectiveUserId,
+          memberName: effectiveName,
+          reason,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (wsErr) {
+        this.logger.warn(`Could not broadcast websocket presence change: ${(wsErr as Error)?.message}`);
+      }
+
       return { success: true };
     } catch (e) {
       return { success: false, error: (e as Error).message };

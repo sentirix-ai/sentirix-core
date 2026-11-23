@@ -233,7 +233,7 @@ export class WorkspaceService {
       const isOnline = !!(
         latestSession &&
         latestSession.isOnline &&
-        now - new Date(latestSession.lastHeartbeatAt).getTime() < 90000
+        now - new Date(latestSession.lastHeartbeatAt).getTime() < 50000
       );
 
       let presenceStatus: 'ONLINE' | 'TERPUTUS' | 'OFFLINE' = 'OFFLINE';
@@ -692,9 +692,21 @@ export class WorkspaceService {
     if (!memberId) return { success: true };
 
     try {
+      // Resolve user by id, username, or fullName for resilient multi-format identifiers
+      const user = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { id: memberId },
+            { username: { equals: memberId, mode: 'insensitive' } },
+            { fullName: { equals: memberId, mode: 'insensitive' } },
+          ],
+        },
+      });
+      const effectiveUserId = user ? user.id : memberId;
+
       // 1. Immediately log out user activity session as MANUAL_LOGOUT in DB
       await this.prisma.userActivitySession.updateMany({
-        where: { userId: memberId, isOnline: true },
+        where: { userId: effectiveUserId, isOnline: true },
         data: {
           isOnline: false,
           logoutAt: new Date(),
@@ -704,7 +716,7 @@ export class WorkspaceService {
 
       const membership = await this.prisma.workspaceMember.findFirst({
         where: {
-          userId: memberId,
+          userId: effectiveUserId,
           ...(workspaceId ? { workspaceId } : {}),
         },
         include: {
@@ -714,11 +726,22 @@ export class WorkspaceService {
       });
 
       if (!membership) {
+        // Broadcast WebSocket presence notification even if membership row was already cleared
+        try {
+          this.eventsGateway.server?.emit('presence:changed', {
+            userId: effectiveUserId,
+            username: user?.username || memberId,
+            fullName: user?.fullName || memberId,
+            isOnline: false,
+            reason: 'MANUAL_LOGOUT',
+            timestamp: new Date().toISOString(),
+          });
+        } catch {}
         return { success: true, message: 'Member not found or already logged out.' };
       }
 
       const wsId = membership.workspaceId;
-      const memberName = membership.user?.fullName || membership.user?.username || 'Team Member';
+      const memberName = membership.user?.fullName || membership.user?.username || user?.fullName || user?.username || 'Team Member';
 
       // Only delete membership for standalone demo workspaces without organization (preserve Multi-Pod team members)
       if (!membership.workspace.organizationId) {
@@ -728,10 +751,10 @@ export class WorkspaceService {
 
         try {
           await this.prisma.user.delete({
-            where: { id: memberId },
+            where: { id: effectiveUserId },
           });
         } catch (delErr) {
-          this.logger.warn(`Could not delete member user ${memberId}: ${(delErr as Error)?.message}`);
+          this.logger.warn(`Could not delete member user ${effectiveUserId}: ${(delErr as Error)?.message}`);
         }
       }
 
@@ -743,12 +766,25 @@ export class WorkspaceService {
       this.logger.log(`Member "${memberName}" logged out (MANUAL_LOGOUT). Remaining members: ${remainingCount}`);
 
       // Broadcast WebSocket notification to owner dashboard
-      this.eventsGateway.server?.emit('team:member_left', {
-        workspaceId: wsId,
-        memberId,
-        memberName,
-        currentMembersCount: remainingCount,
-      });
+      try {
+        this.eventsGateway.server?.emit('team:member_left', {
+          workspaceId: wsId,
+          memberId: effectiveUserId,
+          memberName,
+          currentMembersCount: remainingCount,
+          timestamp: new Date().toISOString(),
+        });
+        this.eventsGateway.server?.emit('presence:changed', {
+          userId: effectiveUserId,
+          username: user?.username || memberName,
+          fullName: memberName,
+          isOnline: false,
+          reason: 'MANUAL_LOGOUT',
+          timestamp: new Date().toISOString(),
+        });
+      } catch (wsErr) {
+        this.logger.warn(`Could not broadcast member_left event: ${(wsErr as Error)?.message}`);
+      }
 
       return { success: true, remainingMembersCount: remainingCount };
     } catch (err) {
@@ -2537,7 +2573,11 @@ export class WorkspaceService {
 
     let org = user?.organization;
     if (!org && user) {
+      // Prioritize active business organizations (e.g. non-healthcare or latest active tenant)
       org = await this.prisma.organization.findFirst({
+        where: {
+          NOT: { industry: 'HEALTHCARE' },
+        },
         include: {
           workspaces: {
             include: {
@@ -2554,8 +2594,32 @@ export class WorkspaceService {
             orderBy: { createdAt: 'asc' },
           },
         },
+        orderBy: { createdAt: 'desc' },
       });
-      if (org && user.id) {
+
+      if (!org) {
+        org = await this.prisma.organization.findFirst({
+          include: {
+            workspaces: {
+              include: {
+                members: { include: { user: true } },
+                tickets: {
+                  include: {
+                    messages: {
+                      orderBy: { createdAt: 'asc' },
+                    },
+                  },
+                },
+                inviteTokens: { orderBy: { createdAt: 'desc' } },
+              },
+              orderBy: { createdAt: 'asc' },
+            },
+          },
+        });
+      }
+
+      // Do NOT attach organizationId to platform owner (@pungkyrama)
+      if (org && user.id && user.username?.toLowerCase() !== 'pungkyrama') {
         await this.prisma.user.update({
           where: { id: user.id },
           data: { organizationId: org.id },
@@ -2635,8 +2699,8 @@ export class WorkspaceService {
           });
         }
 
-        // Collect crisis tickets
-        if (t.priority === 'CRITICAL' && t.status !== 'CLOSED') {
+        // Collect crisis & hanging tickets
+        if ((t.priority === 'CRITICAL' || t.isHanging) && t.status !== 'CLOSED' && t.status !== 'RESOLVED') {
           crisisTickets.push({
             id: t.id,
             ticketNumber: t.ticketNumber,
@@ -2645,6 +2709,9 @@ export class WorkspaceService {
             sentiment: t.sentiment,
             podName: ws.name,
             createdAt: t.createdAt,
+            isHanging: t.isHanging,
+            hangingReason: t.hangingReason,
+            hangingSince: t.hangingSince,
           });
         }
       });
@@ -2795,7 +2862,7 @@ export class WorkspaceService {
       const isActuallyOnline = !!(
         latestSession &&
         latestSession.isOnline &&
-        now - new Date(latestSession.lastHeartbeatAt).getTime() < 90000
+        now - new Date(latestSession.lastHeartbeatAt).getTime() < 50000
       );
 
       // Current online duration in seconds
@@ -3252,6 +3319,17 @@ export class WorkspaceService {
     this.logger.log(
       `Regenerated ${tokenRecord.role} token for Pod "${tokenRecord.workspace.name}": ${cleanToken} -> ${newTokenStr}`,
     );
+
+    // Broadcast instant WebSocket notification for real-time Token Audit Hub update
+    try {
+      this.eventsGateway.server?.emit('token:regenerated', {
+        oldToken: cleanToken,
+        newToken: newTokenStr,
+        role: tokenRecord.role,
+        workspaceId: tokenRecord.workspaceId,
+        timestamp: new Date().toISOString(),
+      });
+    } catch {}
 
     return {
       success: true,

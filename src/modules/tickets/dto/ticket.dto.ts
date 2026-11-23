@@ -61,9 +61,14 @@ export class CreateTicketDto {
 }
 
 export class UpdateTicketStatusDto {
-  @ApiProperty({ enum: ['NEW', 'OPEN', 'PENDING', 'RESOLVED', 'CLOSED'], example: 'IN_PROGRESS' })
+  @ApiProperty({ enum: ['NEW', 'OPEN', 'PENDING', 'RESOLVED', 'CLOSED'], example: 'OPEN' })
   @IsEnum(['NEW', 'OPEN', 'PENDING', 'RESOLVED', 'CLOSED'])
   status: 'NEW' | 'OPEN' | 'PENDING' | 'RESOLVED' | 'CLOSED';
+
+  @ApiPropertyOptional({ example: 'Problem successfully resolved by replacing part.' })
+  @IsOptional()
+  @IsString()
+  resolutionNotes?: string;
 }
 
 export class AssignTicketDto {

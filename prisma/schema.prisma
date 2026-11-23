@@ -7,16 +7,75 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ============================================================================
+// 1. PLATFORM CONTROL PLANE (Eksklusif Ranah Platform Founder / Pungkyrama)
+// ============================================================================
+
+/// Profil kedaulatan Platform Founder bermahkota emas
+model PlatformFounderProfile {
+  id                   String    @id @default(uuid())
+  userId               String    @unique
+  crownBadge           String    @default("GOLD_CROWN_PLATFORM_SOVEREIGN")
+  systemTitle          String    @default("Platform Founder & System Sovereign")
+  lastSystemAuditAt    DateTime?
+  controlPlaneSettings Json?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("platform_founder_profiles")
+}
+
+/// Rekaman historis pertumbuhan dan performa sistem Sentirix dari waktu ke waktu
+model PlatformSnapshot {
+  id                String   @id @default(uuid())
+  recordedAt        DateTime @default(now())
+  totalTenants      Int      @default(0)
+  totalWorkspaces   Int      @default(0)
+  totalUsers        Int      @default(0)
+  totalTickets      Int      @default(0)
+  activeStaffOnline Int      @default(0)
+  systemHealth      String   @default("HEALTHY")
+  growthMetrics     Json?
+  notes             String?
+
+  @@index([recordedAt])
+  @@map("platform_snapshots")
+}
+
+/// Audit jejak tindakan tingkat tinggi Platform Founder (Root Event Stream)
+model PlatformAuditEvent {
+  id           String   @id @default(uuid())
+  actorId      String
+  eventType    String
+  targetEntity String?
+  details      Json?
+  ipAddress    String?
+  createdAt    DateTime @default(now())
+
+  actor        User     @relation(fields: [actorId], references: [id], onDelete: Cascade)
+
+  @@index([actorId])
+  @@index([eventType])
+  @@map("platform_audit_events")
+}
+
+// ============================================================================
+// 2. CORE AUTH & MULTI-TENANT (Organisasi, Pengguna, dan Identitas)
+// ============================================================================
+
 model Organization {
-  id                        String      @id @default(uuid())
+  id                        String                @id @default(uuid())
   name                      String
-  industry                  String      @default("OTHER")
+  industry                  String                @default("OTHER")
   customIndustryDescription String?
-  planTier                  String      @default("MULTI_POD_ENTERPRISE")
-  totalSeats                Int         @default(8)
-  leadershipMode            String      @default("UNIFIED")
-  createdAt                 DateTime    @default(now())
-  updatedAt                 DateTime    @updatedAt
+  planTier                  String                @default("MULTI_POD_ENTERPRISE")
+  totalSeats                Int                   @default(8)
+  leadershipMode            String                @default("UNIFIED")
+  createdAt                 DateTime              @default(now())
+  updatedAt                 DateTime              @updatedAt
+
   users                     User[]
   workspaces                Workspace[]
   activitySessions          UserActivitySession[]
@@ -26,54 +85,71 @@ model Organization {
 }
 
 model User {
-  id                  String                @id @default(uuid())
-  username            String?               @unique
-  email               String                @unique
-  phone               String?
-  passwordHash        String
-  fullName            String
-  role                Role                  @default(CUSTOMER)
-  avatarUrl           String?
-  createdAt           DateTime              @default(now())
-  updatedAt           DateTime              @updatedAt
-  onboardingCompleted Boolean               @default(false)
-  verificationMethod  String?               @default("EMAIL")
-  organizationId      String?
-  auditLogs           AuditLog[]
-  messages            Message[]
-  assignedTickets     Ticket[]              @relation("AgentTickets")
-  createdTickets      Ticket[]              @relation("CustomerTickets")
-  activitySessions    UserActivitySession[]
-  organization        Organization?         @relation(fields: [organizationId], references: [id])
-  workspaceMembership WorkspaceMember?      @relation("WorkspaceMembership")
-  ownedWorkspaces     Workspace[]           @relation("WorkspaceOwner")
+  id                     String                  @id @default(uuid())
+  username               String?                 @unique
+  email                  String                  @unique
+  phone                  String?
+  passwordHash           String
+  fullName               String
+  role                   Role                    @default(CUSTOMER)
+  avatarUrl              String?
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+  onboardingCompleted    Boolean                 @default(false)
+  verificationMethod     String?                 @default("EMAIL")
+  organizationId         String?
+
+  auditLogs              AuditLog[]
+  messages               Message[]
+  assignedTickets        Ticket[]                @relation("AgentTickets")
+  createdTickets         Ticket[]                @relation("CustomerTickets")
+  activitySessions       UserActivitySession[]
+  organization           Organization?           @relation(fields: [organizationId], references: [id])
+  workspaceMembership    WorkspaceMember?        @relation("WorkspaceMembership")
+  ownedWorkspaces        Workspace[]             @relation("WorkspaceOwner")
+
+  // Relasi Platform & Ekosistem Operasional Baru
+  founderProfile         PlatformFounderProfile?
+  platformAuditEvents    PlatformAuditEvent[]
+  agentTicketActivities  AgentTicketActivity[]
+  transferredPodTickets  TicketPodTransfer[]
+  uploadedAttachments    TicketAttachment[]
 
   @@index([organizationId])
   @@map("users")
 }
 
+// ============================================================================
+// 3. POD ARCHITECTURE & STAFFING (Workspace, Kuota, dan Kredensial Sekali Pakai)
+// ============================================================================
+
 model Workspace {
-  id               String                 @id @default(uuid())
-  name             String
-  inviteToken      String                 @default(uuid())
-  ownerId          String
-  createdAt        DateTime               @default(now())
-  updatedAt        DateTime               @updatedAt
-  description      String?
-  isCatchAll       Boolean                @default(false)
-  organizationId   String?
-  podCategory      String                 @default("GENERAL")
-  assignedQuota    Int                    @default(8)
-  isQuotaLocked    Boolean                @default(false)
-  lockedAt         DateTime?
-  services         String[]               @default([])
-  tickets          Ticket[]               @relation("WorkspaceTickets")
-  inviteTokens     WorkspaceInviteToken[]
-  members          WorkspaceMember[]
-  organization     Organization?          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  owner            User                   @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
-  activitySessions UserActivitySession[]
+  id                String                 @id @default(uuid())
+  name              String
+  inviteToken       String                 @default(uuid())
+  ownerId           String
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
+  description       String?
+  isCatchAll        Boolean                @default(false)
+  organizationId    String?
+  podCategory       String                 @default("GENERAL")
+  assignedQuota     Int                    @default(8)
+  isQuotaLocked     Boolean                @default(false)
+  lockedAt          DateTime?
+  services          String[]               @default([])
+
+  tickets           Ticket[]               @relation("WorkspaceTickets")
+  inviteTokens      WorkspaceInviteToken[]
+  members           WorkspaceMember[]
+  organization      Organization?          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  owner             User                   @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  activitySessions  UserActivitySession[]
   knowledgeArticles KnowledgeArticle[]
+
+  // Relasi Jejak Transfer Antar-Pod
+  podTransfersFrom  TicketPodTransfer[]    @relation("TransferredFromPod")
+  podTransfersTo    TicketPodTransfer[]    @relation("TransferredToPod")
 
   @@index([organizationId])
   @@index([ownerId])
@@ -92,6 +168,7 @@ model WorkspaceInviteToken {
   createdAt       DateTime  @default(now())
   expiresAt       DateTime?
   role            String    @default("LEADER")
+
   workspace       Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
   @@index([token])
@@ -105,12 +182,17 @@ model WorkspaceMember {
   userId      String    @unique
   role        String    @default("MEMBER")
   joinedAt    DateTime  @default(now())
+
   user        User      @relation("WorkspaceMembership", fields: [userId], references: [id], onDelete: Cascade)
   workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
   @@index([workspaceId])
   @@map("workspace_members")
 }
+
+// ============================================================================
+// 4. CUSTOMER OPERATIONS & TICKET WORKBENCH (Tiket, Lampiran Multi-Media & SLA)
+// ============================================================================
 
 model Ticket {
   id              String       @id @default(uuid())
@@ -127,35 +209,121 @@ model Ticket {
   updatedAt       DateTime     @updatedAt
   customerName    String?
   workspaceId     String?
+
+  // Kolom kompatibilitas file tunggal lama
   attachmentName  String?
   attachmentType  String?
   attachmentData  String?
+
+  // Kolom Baru: Radar Tiket Menggantung & Resolusi
+  isHanging       Boolean      @default(false)
+  hangingReason   String?
+  hangingSince    DateTime?
+  resolvedAt      DateTime?
+  resolutionNotes String?
+
   auditLogs       AuditLog[]
   messages        Message[]
   assignedAgent   User?        @relation("AgentTickets", fields: [assignedAgentId], references: [id])
   customer        User         @relation("CustomerTickets", fields: [customerId], references: [id])
   workspace       Workspace?   @relation("WorkspaceTickets", fields: [workspaceId], references: [id])
 
+  // Relasi Operasional Baru
+  attachments     TicketAttachment[]
+  agentActivities AgentTicketActivity[]
+  podTransfers    TicketPodTransfer[]
+
   @@index([workspaceId])
   @@index([status, priority])
   @@index([customerId])
   @@index([assignedAgentId])
+  @@index([isHanging])
   @@map("tickets")
 }
 
+/// Tabel multi-lampiran (banyak foto, rekaman audio keluhan, dan dokumen PDF)
+model TicketAttachment {
+  id           String    @id @default(uuid())
+  ticketId     String
+  messageId    String?
+  uploadedById String
+  fileName     String
+  fileType     String
+  fileCategory String    @default("GENERAL")
+  fileSizeByte Int       @default(0)
+  fileUrl      String?
+  fileData     String?
+  caption      String?
+  createdAt    DateTime  @default(now())
+
+  ticket       Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  message      Message?  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  uploadedBy   User      @relation(fields: [uploadedById], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@index([uploadedById])
+  @@index([fileCategory])
+  @@map("ticket_attachments")
+}
+
+/// Rekaman durasi kerja, respon pertama, dan kepatuhan SLA per anggota
+model AgentTicketActivity {
+  id               String    @id @default(uuid())
+  ticketId         String
+  agentId          String
+  startedAt        DateTime  @default(now())
+  firstResponseAt  DateTime?
+  resolvedAt       DateTime?
+  durationSeconds  Int       @default(0)
+  slaTargetSeconds Int       @default(1800)
+  slaStatus        String    @default("ON_TRACK")
+  createdAt        DateTime  @default(now())
+
+  ticket           Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  agent            User      @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@index([agentId])
+  @@map("agent_ticket_activities")
+}
+
+/// Jejak rekam transfer tiket antar-Pod beserta alasan serah terima
+model TicketPodTransfer {
+  id                       String    @id @default(uuid())
+  ticketId                 String
+  fromPodId                String
+  toPodId                  String
+  transferredById          String
+  reason                   String
+  durationInPreviousPodSec Int       @default(0)
+  transferredAt            DateTime  @default(now())
+
+  ticket                   Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  fromPod                  Workspace @relation("TransferredFromPod", fields: [fromPodId], references: [id], onDelete: Cascade)
+  toPod                    Workspace @relation("TransferredToPod", fields: [toPodId], references: [id], onDelete: Cascade)
+  transferredBy            User      @relation(fields: [transferredById], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@index([fromPodId])
+  @@index([toPodId])
+  @@map("ticket_pod_transfers")
+}
+
 model Message {
-  id          String      @id @default(uuid())
-  ticketId    String
-  senderId    String
-  type        MessageType @default(PUBLIC_REPLY)
+  id             String             @id @default(uuid())
+  ticketId       String
+  senderId       String
+  type           MessageType        @default(PUBLIC_REPLY)
   content        String
-  aiGenerated    Boolean     @default(false)
+  aiGenerated    Boolean            @default(false)
   attachmentName String?
   attachmentType String?
   attachmentData String?
-  createdAt      DateTime    @default(now())
-  sender      User        @relation(fields: [senderId], references: [id])
-  ticket      Ticket      @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  createdAt      DateTime           @default(now())
+
+  sender         User               @relation(fields: [senderId], references: [id])
+  ticket         Ticket             @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  attachments    TicketAttachment[]
 
   @@index([ticketId])
   @@map("messages")
@@ -172,6 +340,7 @@ model KnowledgeArticle {
   workspaceId    String?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
+
   organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   workspace      Workspace?    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
@@ -187,6 +356,7 @@ model AuditLog {
   action    String
   details   Json?
   createdAt DateTime @default(now())
+
   actor     User     @relation(fields: [actorId], references: [id])
   ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
 
@@ -207,6 +377,7 @@ model UserActivitySession {
   isOnline        Boolean       @default(true)
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
+
   user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   organization    Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   workspace       Workspace?    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)

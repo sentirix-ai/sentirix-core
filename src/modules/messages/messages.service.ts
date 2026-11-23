@@ -84,6 +84,46 @@ export class MessagesService {
         },
       });
 
+      // Persist individual attachments to ticket_attachments for multi-file evidence hub
+      if (dto.attachments && dto.attachments.length > 0) {
+        for (const att of dto.attachments) {
+          try {
+            await this.prisma.ticketAttachment.create({
+              data: {
+                ticketId: dto.ticketId,
+                messageId: created.id,
+                uploadedById: dto.senderId || 'user-unknown',
+                fileName: att.fileName || 'Attachment',
+                fileType: att.mimeType || 'application/octet-stream',
+                fileSizeByte: att.data ? Math.round((att.data.length * 3) / 4) : 0,
+                fileUrl: att.data || '',
+                fileData: att.data || null,
+                fileCategory: att.mimeType?.startsWith('image/')
+                  ? 'IMAGE_EVIDENCE'
+                  : att.mimeType?.startsWith('audio/')
+                  ? 'AUDIO_RECORDING'
+                  : 'DOCUMENT_PROOF',
+                caption: `Lampiran dalam pesan #${created.id}`,
+              },
+            });
+          } catch (attErr) {
+            this.logger.warn(`Could not save message attachment: ${(attErr as Error)?.message}`);
+          }
+        }
+      }
+
+      // Neutralize hanging status when ticket receives activity/reply
+      try {
+        const ticket = await this.prisma.ticket.findUnique({ where: { id: dto.ticketId } });
+        if (ticket?.isHanging) {
+          const unhungTicket = await this.prisma.ticket.update({
+            where: { id: dto.ticketId },
+            data: { isHanging: false, hangingReason: null, hangingSince: null },
+          });
+          this.eventsGateway.broadcastTicketUpdated(unhungTicket);
+        }
+      } catch {}
+
       const record: MessageRecord = {
         id: created.id,
         ticketId: created.ticketId,

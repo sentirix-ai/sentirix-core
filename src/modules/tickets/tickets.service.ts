@@ -4,6 +4,42 @@ import { AiService } from '../ai/ai.service.js';
 import { EventsGateway } from '../events/events.gateway.js';
 import { CreateTicketDto, UpdateTicketStatusDto, AssignTicketDto } from './dto/ticket.dto.js';
 
+export interface TicketAttachmentInfo {
+  id: string;
+  fileName: string;
+  fileType: string;
+  fileCategory: string;
+  fileSizeByte: number;
+  fileUrl?: string | null;
+  fileData?: string | null;
+  caption?: string | null;
+  createdAt: string;
+}
+
+export interface TicketPodTransferInfo {
+  id: string;
+  fromPodId: string;
+  toPodId: string;
+  fromPodName?: string;
+  toPodName?: string;
+  transferredById: string;
+  transferredByName?: string;
+  reason: string;
+  transferredAt: string;
+}
+
+export interface AgentTicketActivityInfo {
+  id: string;
+  agentId: string;
+  agentName?: string;
+  startedAt: string;
+  firstResponseAt?: string | null;
+  resolvedAt?: string | null;
+  durationSeconds: number;
+  slaTargetSeconds: number;
+  slaStatus: string;
+}
+
 export interface TicketRecord {
   id: string;
   ticketNumber: number;
@@ -22,6 +58,14 @@ export interface TicketRecord {
   attachmentName?: string | null;
   attachmentType?: string | null;
   attachmentData?: string | null;
+  isHanging?: boolean;
+  hangingReason?: string | null;
+  hangingSince?: string | null;
+  resolvedAt?: string | null;
+  resolutionNotes?: string | null;
+  attachments?: TicketAttachmentInfo[];
+  podTransfers?: TicketPodTransferInfo[];
+  agentActivities?: AgentTicketActivityInfo[];
   createdAt: string;
   updatedAt: string;
 }
@@ -116,6 +160,67 @@ export class TicketsService {
         },
       });
 
+      // Save multi-attachments into ticket_attachments table
+      const savedAttachments: TicketAttachmentInfo[] = [];
+      if (dto.attachments && dto.attachments.length > 0) {
+        for (const att of dto.attachments) {
+          try {
+            const mime = att.mimeType || 'image/png';
+            const cat = (att as any).category || (mime.startsWith('image/') ? 'PHOTO_DAMAGE' : mime.includes('pdf') ? 'INVOICE' : mime.includes('audio') ? 'AUDIO_COMPLAINT' : 'GENERAL');
+            const saved = await this.prisma.ticketAttachment.create({
+              data: {
+                ticketId: created.id,
+                uploadedById: finalCustomerId,
+                fileName: att.fileName || 'attachment',
+                fileType: mime,
+                fileCategory: cat,
+                fileSizeByte: att.data ? Buffer.byteLength(att.data, 'utf8') : 0,
+                fileData: att.data || null,
+                caption: (att as any).caption || null,
+              },
+            });
+            savedAttachments.push({
+              id: saved.id,
+              fileName: saved.fileName,
+              fileType: saved.fileType,
+              fileCategory: saved.fileCategory,
+              fileSizeByte: saved.fileSizeByte,
+              fileUrl: saved.fileUrl,
+              fileData: saved.fileData,
+              caption: saved.caption,
+              createdAt: saved.createdAt.toISOString(),
+            });
+          } catch {}
+        }
+      } else if (attachmentData || attachmentName) {
+        try {
+          const mime = attachmentType || 'image/png';
+          const cat = mime.startsWith('image/') ? 'PHOTO_DAMAGE' : mime.includes('pdf') ? 'INVOICE' : 'GENERAL';
+          const saved = await this.prisma.ticketAttachment.create({
+            data: {
+              ticketId: created.id,
+              uploadedById: finalCustomerId,
+              fileName: attachmentName || 'ticket-proof',
+              fileType: mime,
+              fileCategory: cat,
+              fileSizeByte: attachmentData ? Buffer.byteLength(attachmentData, 'utf8') : 0,
+              fileData: attachmentData || null,
+            },
+          });
+          savedAttachments.push({
+            id: saved.id,
+            fileName: saved.fileName,
+            fileType: saved.fileType,
+            fileCategory: saved.fileCategory,
+            fileSizeByte: saved.fileSizeByte,
+            fileUrl: saved.fileUrl,
+            fileData: saved.fileData,
+            caption: saved.caption,
+            createdAt: saved.createdAt.toISOString(),
+          });
+        } catch {}
+      }
+
       const record: TicketRecord = {
         id: created.id,
         ticketNumber: created.ticketNumber,
@@ -137,6 +242,12 @@ export class TicketsService {
         attachmentName: created.attachmentName,
         attachmentType: created.attachmentType,
         attachmentData: created.attachmentData,
+        isHanging: created.isHanging,
+        hangingReason: created.hangingReason,
+        hangingSince: created.hangingSince ? created.hangingSince.toISOString() : null,
+        resolvedAt: created.resolvedAt ? created.resolvedAt.toISOString() : null,
+        resolutionNotes: created.resolutionNotes,
+        attachments: savedAttachments,
         createdAt: created.createdAt.toISOString(),
         updatedAt: created.updatedAt.toISOString(),
       };
@@ -199,6 +310,15 @@ export class TicketsService {
           customer: true,
           assignedAgent: true,
           workspace: true,
+          attachments: true,
+          podTransfers: {
+            include: { fromPod: true, toPod: true, transferredBy: true },
+            orderBy: { transferredAt: 'desc' },
+          },
+          agentActivities: {
+            include: { agent: true },
+            orderBy: { startedAt: 'desc' },
+          },
         },
         orderBy: { createdAt: 'desc' },
       });
@@ -222,6 +342,44 @@ export class TicketsService {
           attachmentName: t.attachmentName,
           attachmentType: t.attachmentType,
           attachmentData: t.attachmentData,
+          isHanging: t.isHanging,
+          hangingReason: t.hangingReason,
+          hangingSince: t.hangingSince ? t.hangingSince.toISOString() : null,
+          resolvedAt: t.resolvedAt ? t.resolvedAt.toISOString() : null,
+          resolutionNotes: t.resolutionNotes,
+          attachments: (t as any).attachments?.map((a: any) => ({
+            id: a.id,
+            fileName: a.fileName,
+            fileType: a.fileType,
+            fileCategory: a.fileCategory,
+            fileSizeByte: a.fileSizeByte,
+            fileUrl: a.fileUrl,
+            fileData: a.fileData,
+            caption: a.caption,
+            createdAt: a.createdAt.toISOString(),
+          })) || [],
+          podTransfers: (t as any).podTransfers?.map((pt: any) => ({
+            id: pt.id,
+            fromPodId: pt.fromPodId,
+            toPodId: pt.toPodId,
+            fromPodName: pt.fromPod?.name || null,
+            toPodName: pt.toPod?.name || null,
+            transferredById: pt.transferredById,
+            transferredByName: pt.transferredBy?.fullName || pt.transferredBy?.username || null,
+            reason: pt.reason,
+            transferredAt: pt.transferredAt.toISOString(),
+          })) || [],
+          agentActivities: (t as any).agentActivities?.map((act: any) => ({
+            id: act.id,
+            agentId: act.agentId,
+            agentName: act.agent?.fullName || act.agent?.username || null,
+            startedAt: act.startedAt.toISOString(),
+            firstResponseAt: act.firstResponseAt ? act.firstResponseAt.toISOString() : null,
+            resolvedAt: act.resolvedAt ? act.resolvedAt.toISOString() : null,
+            durationSeconds: act.durationSeconds,
+            slaTargetSeconds: act.slaTargetSeconds,
+            slaStatus: act.slaStatus,
+          })) || [],
           createdAt: t.createdAt.toISOString(),
           updatedAt: t.updatedAt.toISOString(),
         }));
@@ -251,7 +409,20 @@ export class TicketsService {
     try {
       const ticket = await this.prisma.ticket.findUnique({
         where: { id },
-        include: { customer: true, assignedAgent: true },
+        include: {
+          customer: true,
+          assignedAgent: true,
+          workspace: true,
+          attachments: true,
+          podTransfers: {
+            include: { fromPod: true, toPod: true, transferredBy: true },
+            orderBy: { transferredAt: 'desc' },
+          },
+          agentActivities: {
+            include: { agent: true },
+            orderBy: { startedAt: 'desc' },
+          },
+        },
       });
       if (ticket) {
         return {
@@ -264,12 +435,52 @@ export class TicketsService {
           sentiment: ticket.sentiment as any,
           tags: ticket.tags,
           customerId: ticket.customerId,
-          customerName: ticket.customer?.fullName || 'Customer User',
+          customerName: ticket.customerName || ticket.customer?.fullName || 'Customer User',
           assignedAgentId: ticket.assignedAgentId,
           assignedAgentName: ticket.assignedAgent?.fullName || null,
+          workspaceId: ticket.workspaceId,
+          workspaceName: (ticket as any).workspace?.name || null,
           attachmentName: ticket.attachmentName,
           attachmentType: ticket.attachmentType,
           attachmentData: ticket.attachmentData,
+          isHanging: ticket.isHanging,
+          hangingReason: ticket.hangingReason,
+          hangingSince: ticket.hangingSince ? ticket.hangingSince.toISOString() : null,
+          resolvedAt: ticket.resolvedAt ? ticket.resolvedAt.toISOString() : null,
+          resolutionNotes: ticket.resolutionNotes,
+          attachments: (ticket as any).attachments?.map((a: any) => ({
+            id: a.id,
+            fileName: a.fileName,
+            fileType: a.fileType,
+            fileCategory: a.fileCategory,
+            fileSizeByte: a.fileSizeByte,
+            fileUrl: a.fileUrl,
+            fileData: a.fileData,
+            caption: a.caption,
+            createdAt: a.createdAt.toISOString(),
+          })) || [],
+          podTransfers: (ticket as any).podTransfers?.map((pt: any) => ({
+            id: pt.id,
+            fromPodId: pt.fromPodId,
+            toPodId: pt.toPodId,
+            fromPodName: pt.fromPod?.name || null,
+            toPodName: pt.toPod?.name || null,
+            transferredById: pt.transferredById,
+            transferredByName: pt.transferredBy?.fullName || pt.transferredBy?.username || null,
+            reason: pt.reason,
+            transferredAt: pt.transferredAt.toISOString(),
+          })) || [],
+          agentActivities: (ticket as any).agentActivities?.map((act: any) => ({
+            id: act.id,
+            agentId: act.agentId,
+            agentName: act.agent?.fullName || act.agent?.username || null,
+            startedAt: act.startedAt.toISOString(),
+            firstResponseAt: act.firstResponseAt ? act.firstResponseAt.toISOString() : null,
+            resolvedAt: act.resolvedAt ? act.resolvedAt.toISOString() : null,
+            durationSeconds: act.durationSeconds,
+            slaTargetSeconds: act.slaTargetSeconds,
+            slaStatus: act.slaStatus,
+          })) || [],
           createdAt: ticket.createdAt.toISOString(),
           updatedAt: ticket.updatedAt.toISOString(),
         };
@@ -285,16 +496,49 @@ export class TicketsService {
     return mem;
   }
 
-  async updateStatus(id: string, dto: UpdateTicketStatusDto): Promise<TicketRecord> {
+  async updateStatus(id: string, dto: UpdateTicketStatusDto & { resolutionNotes?: string }): Promise<TicketRecord> {
     const ticket = await this.findOne(id);
     ticket.status = dto.status;
     ticket.updatedAt = new Date().toISOString();
+    const isResolving = dto.status === 'RESOLVED' || dto.status === 'CLOSED';
+    const now = new Date();
+
+    if (isResolving) {
+      ticket.resolvedAt = now.toISOString();
+      ticket.resolutionNotes = dto.resolutionNotes || 'Problem successfully resolved';
+      ticket.isHanging = false;
+      ticket.hangingReason = null;
+    }
 
     try {
       await this.prisma.ticket.update({
         where: { id },
-        data: { status: dto.status as any },
+        data: {
+          status: dto.status as any,
+          isHanging: false,
+          hangingReason: null,
+          ...(isResolving ? { resolvedAt: now, resolutionNotes: dto.resolutionNotes || 'Resolved successfully' } : {}),
+        },
       });
+
+      // Update agent ticket activity SLA record if resolving
+      if (isResolving && ticket.assignedAgentId) {
+        const act = await this.prisma.agentTicketActivity.findFirst({
+          where: { ticketId: id, agentId: ticket.assignedAgentId, resolvedAt: null },
+          orderBy: { startedAt: 'desc' },
+        });
+        if (act) {
+          const durationSec = Math.max(0, Math.floor((now.getTime() - new Date(act.startedAt).getTime()) / 1000));
+          await this.prisma.agentTicketActivity.update({
+            where: { id: act.id },
+            data: {
+              resolvedAt: now,
+              durationSeconds: durationSec,
+              slaStatus: durationSec <= act.slaTargetSeconds ? 'MET' : 'BREACHED',
+            },
+          });
+        }
+      }
     } catch {
       // Fallback updated memory reference
     }
@@ -308,11 +552,28 @@ export class TicketsService {
     ticket.assignedAgentId = dto.agentId;
     ticket.assignedAgentName = dto.agentId === 'agent-01' ? 'Marcus Vance' : 'Assigned Agent';
     ticket.updatedAt = new Date().toISOString();
+    ticket.isHanging = false;
+    ticket.hangingReason = null;
 
     try {
       await this.prisma.ticket.update({
         where: { id },
-        data: { assignedAgentId: dto.agentId },
+        data: {
+          assignedAgentId: dto.agentId,
+          isHanging: false,
+          hangingReason: null,
+        },
+      });
+
+      // Start an AgentTicketActivity record to track AHT & SLA
+      await this.prisma.agentTicketActivity.create({
+        data: {
+          ticketId: id,
+          agentId: dto.agentId,
+          startedAt: new Date(),
+          slaTargetSeconds: 1800,
+          slaStatus: 'ON_TRACK',
+        },
       });
     } catch {
       // Fallback
@@ -353,6 +614,24 @@ export class TicketsService {
           workspace: true,
         },
       });
+
+      // Record permanent audit trail in ticket_pod_transfers
+      if (previousPodId) {
+        try {
+          await this.prisma.ticketPodTransfer.create({
+            data: {
+              ticketId,
+              fromPodId: previousPodId,
+              toPodId: targetPodId,
+              transferredById: actorId || ticket.customerId,
+              reason: handoverNote || `Cross-pod handover to ${targetPod.name}`,
+              durationInPreviousPodSec: 0,
+            },
+          });
+        } catch (tErr) {
+          this.logger.warn(`Could not log ticket pod transfer: ${(tErr as Error)?.message}`);
+        }
+      }
 
       // Insert handover message if note is provided
       if (handoverNote) {

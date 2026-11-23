@@ -194,6 +194,32 @@ export class AnalyticsService {
       };
     });
 
+    // 6. Record periodic Sovereign Snapshot in platform_snapshots
+    try {
+      const lastSnap = await this.prisma.platformSnapshot.findFirst({
+        orderBy: { recordedAt: 'desc' },
+      });
+      const now = new Date();
+      // Record at most once every 10 minutes
+      if (!lastSnap || now.getTime() - new Date(lastSnap.recordedAt).getTime() > 600000) {
+        await this.prisma.platformSnapshot.create({
+          data: {
+            totalTenants: await this.prisma.organization.count(),
+            totalWorkspaces,
+            totalUsers: totalUsers + 1,
+            totalTickets,
+            activeStaffOnline: await this.prisma.userActivitySession.count({ where: { isOnline: true } }),
+            systemHealth: 'HEALTHY',
+            growthMetrics: {
+              onboardingRate,
+              capacityDistribution,
+            },
+            notes: 'Automated periodic telemetry snapshot',
+          },
+        });
+      }
+    } catch {}
+
     return {
       summary: {
         totalUsers,
