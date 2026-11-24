@@ -240,7 +240,7 @@ export class WorkspaceService {
       const isOnline = !!(
         latestSession &&
         latestSession.isOnline &&
-        now - new Date(latestSession.lastHeartbeatAt).getTime() < 50000
+        now - new Date(latestSession.lastHeartbeatAt).getTime() < 90000
       );
 
       let presenceStatus: 'ONLINE' | 'TERPUTUS' | 'OFFLINE' = 'OFFLINE';
@@ -1481,8 +1481,9 @@ export class WorkspaceService {
           podCategory: pod.podCategory || 'GENERAL',
           description: pod.description || null,
           services: pod.services || [],
-          assignedQuota: 8,
-          isQuotaLocked: false,
+          assignedQuota: Number(pod.seats) || 8,
+          isQuotaLocked: true,
+          lockedAt: new Date(),
           inviteToken: leaderTokenStr,
           ownerId: user.id,
           organizationId: organization.id,
@@ -1592,13 +1593,78 @@ export class WorkspaceService {
       tokenRecord.usedBy ||
       null;
 
-    // Strict Single-Leader Enforcement: If the Pod ALREADY has an active Leader, reject duplicate activation
+    // Single-Leader Dynamic Presence Check: If the Pod ALREADY has an active Leader, check if currently online in another session
     if (activeLeaderMember) {
+      const leaderUser = activeLeaderMember.user;
+      let isLeaderOnline = false;
+      if (leaderUser) {
+        const activeSession = await this.prisma.userActivitySession.findFirst({
+          where: {
+            userId: leaderUser.id,
+            isOnline: true,
+          },
+          orderBy: { loginAt: 'desc' },
+        });
+        if (activeSession) {
+          const lastActivityTime = activeSession.lastHeartbeatAt || activeSession.loginAt;
+          const diffMs = Date.now() - new Date(lastActivityTime).getTime();
+          if (diffMs <= 90000) {
+            isLeaderOnline = true;
+          }
+        }
+      }
+
+      if (isLeaderOnline) {
+        return {
+          valid: false,
+          isLockedToOtherSession: true,
+          isClaimed: true,
+          error: `Leadership seat for "${currentWorkspace.name}" is currently engaged in an active browser session by ${existingLeaderName || 'the assigned Team Lead'}. Under enterprise security governance policies, concurrent multi-browser access is strictly prohibited. To access this workspace, please close the active session on your other device or contact your System Administrator.`,
+          workspaceName: currentWorkspace.name,
+          leaderName: existingLeaderName,
+        };
+      }
+
+      // If Leader is OFFLINE / LOGGED OUT:
+      // If this exact token was already consumed:
+      if (tokenRecord.isUsed) {
+        return {
+          valid: false,
+          isUsed: true,
+          isClaimed: true,
+          error: `This leader activation token has already been claimed by ${tokenRecord.usedBy || existingLeaderName || 'another user'}. Under enterprise security governance policies, single-use access links expire upon entry. Please request a fresh invitation link from your Super Admin.`,
+          workspaceName: currentWorkspace.name,
+        };
+      }
+
+      // Allow seamless re-login with newly regenerated token!
       return {
-        valid: false,
-        isClaimed: true,
-        error: `This invitation is no longer active because ${existingLeaderName || 'an assigned Leader'} has already assumed leadership for ${currentWorkspace.name}. Under organizational governance policy, each operational pod maintains exactly one Team Lead seat. Please sign in with your corporate credentials.`,
-        workspaceName: currentWorkspace.name,
+        valid: true,
+        token: tokenRecord.token,
+        role: 'LEADER',
+        isExistingLeader: true,
+        isReLogin: true,
+        existingLeaderName: existingLeaderName,
+        leaderUser: {
+          id: leaderUser?.id,
+          username: leaderUser?.username,
+          fullName: leaderUser?.fullName,
+          email: leaderUser?.email,
+          role: 'LEADER',
+        },
+        workspace: {
+          id: currentWorkspace.id,
+          name: currentWorkspace.name,
+          podCategory: currentWorkspace.podCategory,
+          services: currentWorkspace.services,
+          isQuotaLocked: Boolean(currentWorkspace.isQuotaLocked || currentWorkspace.podCategory === 'SPECIALIZED'),
+          assignedQuota: currentWorkspace.assignedQuota,
+        },
+        organization: {
+          id: organization.id,
+          name: organization.name,
+          totalSeats: organization.totalSeats || 20,
+        },
       };
     }
 
@@ -1606,7 +1672,7 @@ export class WorkspaceService {
       return {
         valid: false,
         isUsed: true,
-        error: `This leader activation token has already been claimed by ${tokenRecord.usedBy || 'another user'} on ${tokenRecord.usedAt ? new Date(tokenRecord.usedAt).toLocaleString() : 'earlier'}. Each single-use token can only be claimed once. Please request a fresh regenerated token from your Super Admin.`,
+        error: `This leader activation token has already been claimed by ${tokenRecord.usedBy || 'another user'}. Under enterprise security governance policies, single-use access links expire upon entry. Please request a fresh invitation link from your Super Admin.`,
         workspaceName: tokenRecord.workspace?.name,
       };
     }
@@ -1670,8 +1736,8 @@ export class WorkspaceService {
     let maxSubordinatesAllowed: number;
     let allowedOptions: number[];
 
-    if (currentWorkspace.isQuotaLocked) {
-      // This pod is already locked
+    if (currentWorkspace.isQuotaLocked || currentWorkspace.podCategory === 'SPECIALIZED') {
+      // This pod is already locked or pre-allocated by admin
       const currentSubordinates = Math.max(1, currentWorkspace.assignedQuota - 1);
       maxSubordinatesAllowed = currentSubordinates;
       allowedOptions = [currentSubordinates];
@@ -1742,7 +1808,7 @@ export class WorkspaceService {
         name: currentWorkspace.name,
         podCategory: currentWorkspace.podCategory,
         services: currentWorkspace.services,
-        isQuotaLocked: currentWorkspace.isQuotaLocked,
+        isQuotaLocked: Boolean(currentWorkspace.isQuotaLocked || currentWorkspace.podCategory === 'SPECIALIZED'),
         assignedQuota: currentWorkspace.assignedQuota,
       },
       organization: {
@@ -1940,64 +2006,83 @@ export class WorkspaceService {
 
     const workspace = tokenRecord.workspace;
 
-    // Strict Single-Leader Enforcement: If Pod ALREADY has an active Leader, reject duplicate activation
+    // Single-Leader Dynamic Presence Check: If Pod ALREADY has an active Leader, check if currently online in another session
     const existingLeaderMember = workspace.members.find(
       (m: any) => m.role === 'LEADER',
     );
 
-    if (existingLeaderMember && existingLeaderMember.user) {
-      throw new BadRequestException(
-        `Leadership seat for ${workspace.name} is already occupied by ${existingLeaderMember.user.fullName || existingLeaderMember.user.username}. Under organizational governance policy, each pod maintains exactly one active Team Lead.`,
-      );
-    }
-
+    let leaderUser: any;
+    let totalPodQuota = workspace.assignedQuota || 2;
     const maxAllowed = quotaStatus.quotaStats.maxSubordinatesAllowed;
-    // Auto-clamp chosen count to available capacity so leader activation never crashes
-    const safeCount = Math.min(Math.max(1, chosenCount), maxAllowed);
+    const safeCount =
+      workspace.isQuotaLocked && workspace.assignedQuota
+        ? Math.max(1, workspace.assignedQuota - 1)
+        : Math.min(Math.max(1, chosenCount), maxAllowed);
 
-    // 2. Create Leader User Account (First time activation)
-    const slug = cleanName
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, '')
-      .slice(0, 10);
-    const username = `${slug || 'leader'}_${Math.floor(1000 + Math.random() * 9000)}`;
-    const email = `${username}@team.${workspace.id.slice(0, 8)}.sentrix.local`;
-    const passwordHash =
-      password && password.trim() !== ''
-        ? crypto.createHash('sha256').update(password.trim()).digest('hex')
-        : crypto.createHash('sha256').update('0o0o 0o0o').digest('hex');
+    if (existingLeaderMember && existingLeaderMember.user) {
+      // Re-login scenario: Check if Leader is online in another session
+      const activeSession = await this.prisma.userActivitySession.findFirst({
+        where: { userId: existingLeaderMember.userId, isOnline: true },
+        orderBy: { loginAt: 'desc' },
+      });
+      const isSessionOnline =
+        activeSession &&
+        Date.now() - new Date(activeSession.lastHeartbeatAt || activeSession.loginAt).getTime() <= 90000;
 
-    const leaderUser = await this.prisma.user.create({
-      data: {
-        username,
-        fullName: cleanName,
-        email,
-        passwordHash,
-        role: 'POD_LEADER',
-        organizationId: workspace.organizationId,
-        onboardingCompleted: true,
-      },
-    });
+      if (isSessionOnline) {
+        throw new BadRequestException(
+          `Leadership seat for "${workspace.name}" is currently engaged in an active browser session by ${existingLeaderMember.user.fullName || existingLeaderMember.user.username}. Under enterprise security governance policies, concurrent multi-browser access is strictly prohibited.`,
+        );
+      }
 
-    // 3. Bind Leader to Workspace
-    await this.prisma.workspaceMember.create({
-      data: {
-        workspaceId: workspace.id,
-        userId: leaderUser.id,
-        role: 'LEADER',
-      },
-    });
+      leaderUser = existingLeaderMember.user;
+    } else {
+      // First time leader creation:
+      const slug = cleanName
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '')
+        .slice(0, 10);
+      const username = `${slug || 'leader'}_${Math.floor(1000 + Math.random() * 9000)}`;
+      const email = `${username}@team.${workspace.id.slice(0, 8)}.sentrix.local`;
+      const passwordHash =
+        password && password.trim() !== ''
+          ? crypto.createHash('sha256').update(password.trim()).digest('hex')
+          : crypto.createHash('sha256').update('0o0o 0o0o').digest('hex');
 
-    // 4. Lock Workspace Quota
-    const totalPodQuota = 1 + safeCount; // 1 Leader + M Agen
-    await this.prisma.workspace.update({
-      where: { id: workspace.id },
-      data: {
-        assignedQuota: totalPodQuota,
-        isQuotaLocked: true,
-        lockedAt: new Date(),
-      },
-    });
+      leaderUser = await this.prisma.user.create({
+        data: {
+          username,
+          fullName: cleanName,
+          email,
+          passwordHash,
+          role: 'POD_LEADER',
+          organizationId: workspace.organizationId,
+          onboardingCompleted: true,
+        },
+      });
+
+      await this.prisma.workspaceMember.create({
+        data: {
+          workspaceId: workspace.id,
+          userId: leaderUser.id,
+          role: 'LEADER',
+        },
+      });
+
+      // Lock Workspace Quota
+      totalPodQuota =
+        workspace.isQuotaLocked && workspace.assignedQuota
+          ? workspace.assignedQuota
+          : 1 + safeCount;
+      await this.prisma.workspace.update({
+        where: { id: workspace.id },
+        data: {
+          assignedQuota: totalPodQuota,
+          isQuotaLocked: true,
+          lockedAt: workspace.lockedAt || new Date(),
+        },
+      });
+    }
 
     // Auto-lock neighboring pod if exactly 1 unlocked pod remains
     if (workspace.organizationId) {
@@ -2201,14 +2286,73 @@ export class WorkspaceService {
       };
     }
 
-    // Strict Single-Use Token Check: If already used, permanently locked
+    // Dynamic Presence Check for Frontline Agent
     if (tokenRecord.isUsed) {
+      const agentName = tokenRecord.usedBy || 'an active team member';
       return {
         valid: false,
-        isUsed: true,
-        error: `This single-use invitation token has already been claimed by ${tokenRecord.usedBy || 'a team member'} and is permanently locked. Each token can only be used once.`,
+        isClaimed: true,
+        error: `This invitation link has already been claimed by ${agentName} and can no longer be used. Under enterprise security governance policies, single-use access links expire upon entry. Please request a fresh invitation link from your Pod Leader.`,
         workspaceName: tokenRecord.workspace?.name,
+        assignedMemberName: tokenRecord.usedBy,
       };
+    }
+
+    if (tokenRecord.usedBy) {
+      const agentName = tokenRecord.usedBy;
+      const agentUser = await this.prisma.user.findFirst({
+        where: {
+          fullName: { equals: agentName, mode: 'insensitive' },
+          workspaceMembership: { workspaceId: tokenRecord.workspaceId, role: 'AGENT' },
+        },
+      });
+
+      if (agentUser) {
+        const activeSession = await this.prisma.userActivitySession.findFirst({
+          where: {
+            userId: agentUser.id,
+            isOnline: true,
+          },
+          orderBy: { loginAt: 'desc' },
+        });
+
+        const isSessionOnline =
+          activeSession &&
+          Date.now() - new Date(activeSession.lastHeartbeatAt || activeSession.loginAt).getTime() <= 90000;
+
+        if (isSessionOnline) {
+          return {
+            valid: false,
+            isLockedToOtherSession: true,
+            isClaimed: true,
+            error: `This frontline seat for "${tokenRecord.workspace?.name || 'this Pod'}" is currently engaged in an active browser session by ${agentName}. Under enterprise security governance policies, concurrent multi-browser access is strictly prohibited. To access this workspace, please close the active session on your other device or contact your System Administrator.`,
+            workspaceName: tokenRecord.workspace?.name,
+            assignedMemberName: agentName,
+          };
+        }
+
+        // If member is OFFLINE / LOGGED OUT: Allow re-login!
+        return {
+          valid: true,
+          token: tokenRecord.token,
+          role: 'AGENT',
+          isReLogin: true,
+          assignedMemberName: agentName,
+          workspace: {
+            id: tokenRecord.workspace?.id,
+            name: tokenRecord.workspace?.name,
+            podCategory: tokenRecord.workspace?.podCategory,
+            services: tokenRecord.workspace?.services,
+          },
+          organization: {
+            id: tokenRecord.workspace?.organization?.id,
+            name: tokenRecord.workspace?.organization?.name,
+          },
+          leaderName:
+            tokenRecord.workspace?.members?.find((m: any) => m.role === 'LEADER')
+              ?.user?.fullName || null,
+        };
+      }
     }
 
     // First-Open Browser Session Lock: Disallow simultaneous opening in a second browser (PostgreSQL Persisted)
@@ -2321,40 +2465,44 @@ export class WorkspaceService {
 
     if (tokenRecord.isUsed) {
       throw new BadRequestException(
-        `This invitation token has already been claimed by ${tokenRecord.usedBy || 'another member'} and is permanently locked.`,
+        `This invitation token has already been claimed and consumed under organizational governance policy.`,
       );
     }
 
     const workspace = tokenRecord.workspace;
 
-    // Check if an existing member with the exact same name or username already belongs to this workspace, or matches assigned token owner
-    const allocatedName = (tokenRecord.usedBy || '').trim().toLowerCase();
+    // Check if an existing member with the exact same name or username already belongs to this workspace
     const existingMember = workspace.members.find(
       (m: any) =>
         m.user?.fullName?.trim().toLowerCase() === cleanName.toLowerCase() ||
-        m.user?.username?.trim().toLowerCase() === cleanName.toLowerCase() ||
-        (allocatedName && m.user?.fullName?.trim().toLowerCase() === allocatedName) ||
-        (allocatedName && m.user?.username?.trim().toLowerCase() === allocatedName),
+        m.user?.username?.trim().toLowerCase() === cleanName.toLowerCase(),
     );
 
-    let agentUser: any = null;
+    let agentUser: any;
 
     if (existingMember && existingMember.user) {
-      // Re-login / restore access for existing member (e.g. Budi, Tini reclaiming access via regenerated token)
-      agentUser = existingMember.user;
-      if (password && password.trim() !== '') {
-        const passwordHash = crypto
-          .createHash('sha256')
-          .update(password.trim())
-          .digest('hex');
-        await this.prisma.user.update({
-          where: { id: agentUser.id },
-          data: { passwordHash },
+      // Re-login scenario: Verify this token was allocated to this member
+      if (tokenRecord.usedBy && tokenRecord.usedBy.toLowerCase() === cleanName.toLowerCase()) {
+        const activeSession = await this.prisma.userActivitySession.findFirst({
+          where: { userId: existingMember.userId, isOnline: true },
+          orderBy: { loginAt: 'desc' },
         });
+        const isSessionOnline =
+          activeSession &&
+          Date.now() - new Date(activeSession.lastHeartbeatAt || activeSession.loginAt).getTime() <= 90000;
+
+        if (isSessionOnline) {
+          throw new BadRequestException(
+            `This frontline seat for "${workspace.name}" is currently engaged in an active browser session by ${cleanName}. Under enterprise security governance policies, concurrent multi-browser access is strictly prohibited.`,
+          );
+        }
+
+        agentUser = existingMember.user;
+      } else {
+        throw new BadRequestException(
+          `A frontline agent named "${cleanName}" already belongs to "${workspace.name}". Each team member seat must be distinct.`,
+        );
       }
-      this.logger.log(
-        `Existing member "${cleanName}" (@${agentUser.username}) reclaimed token into Pod "${workspace.name}".`,
-      );
     } else {
       // New member joining: check capacity strictly
       if (workspace.members.length >= workspace.assignedQuota) {
@@ -2403,7 +2551,7 @@ export class WorkspaceService {
       data: {
         isUsed: true,
         usedBy: cleanName,
-        usedAt: existingMember ? (existingMember.joinedAt || new Date()) : new Date(),
+        usedAt: new Date(),
       },
     });
 
@@ -2430,6 +2578,13 @@ export class WorkspaceService {
           lastHeartbeatAt: new Date(),
           isOnline: true,
         },
+      });
+
+      // Single Concurrent Session: Terminate any existing remote sessions for this agent
+      this.eventsGateway.server?.emit('auth:session_terminated', {
+        userId: agentUser.id,
+        username: agentUser.username,
+        reason: 'CONCURRENT_LOGIN',
       });
     } catch (sessionErr) {
       this.logger.warn(`Failed to create agent activity session: ${(sessionErr as Error)?.message}`);
@@ -2794,7 +2949,7 @@ export class WorkspaceService {
       const isActuallyOnline = !!(
         latestSession &&
         latestSession.isOnline &&
-        now - new Date(latestSession.lastHeartbeatAt).getTime() < 50000
+        now - new Date(latestSession.lastHeartbeatAt).getTime() < 90000
       );
 
       // Current online duration in seconds
@@ -3189,41 +3344,13 @@ export class WorkspaceService {
         where: { workspaceId: tokenRecord.workspaceId, role: 'LEADER' },
         include: { user: true },
       });
-      if (activeLeaderMember) {
-        throw new BadRequestException(
-          `Leadership seat for "${tokenRecord.workspace.name}" is already assigned to ${activeLeaderMember.user?.fullName || activeLeaderMember.user?.username}. Under organizational governance policy, each pod maintains exactly one Team Lead. To rotate or reassign pod leadership, manage members in the Admin Cockpit.`,
-        );
-      }
-      isAlreadyClaimed = tokenRecord.isUsed;
-      retainedUsedBy = tokenRecord.usedBy;
-      retainedUsedAt = tokenRecord.usedAt || new Date();
+      retainedUsedBy =
+        activeLeaderMember?.user?.fullName ||
+        activeLeaderMember?.user?.username ||
+        tokenRecord.usedBy ||
+        null;
     } else {
-      // For AGENT member:
-      // If token was already used or had an assigned user, preserve their activated status and name
-      const previousName = (tokenRecord.usedBy || '').trim();
-      if (previousName || tokenRecord.isUsed) {
-        const activeMember = await this.prisma.workspaceMember.findFirst({
-          where: {
-            workspaceId: tokenRecord.workspaceId,
-            role: 'AGENT',
-            OR: [
-              { user: { fullName: { equals: previousName, mode: 'insensitive' } } },
-              { user: { username: { equals: previousName, mode: 'insensitive' } } },
-            ],
-          },
-          include: { user: true },
-        });
-
-        if (activeMember && activeMember.user) {
-          isAlreadyClaimed = true;
-          retainedUsedBy = activeMember.user.fullName || activeMember.user.username;
-          retainedUsedAt = activeMember.joinedAt || tokenRecord.usedAt || new Date();
-        } else if (previousName) {
-          isAlreadyClaimed = true;
-          retainedUsedBy = previousName;
-          retainedUsedAt = tokenRecord.usedAt || new Date();
-        }
-      }
+      retainedUsedBy = (tokenRecord.usedBy || '').trim() || null;
     }
 
     // Update the existing token in-place to avoid bloated duplicate rows

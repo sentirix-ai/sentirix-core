@@ -689,7 +689,9 @@ Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
     }>;
     defaultServices?: string[];
   } {
-    const key = (industry || 'OTHER').toUpperCase().trim();
+    const rawDesc = (customDescription || '').toUpperCase().trim();
+    const isOther = (industry || 'OTHER').toUpperCase().trim() === 'OTHER';
+    const key = isOther && rawDesc ? rawDesc : (industry || 'OTHER').toUpperCase().trim();
 
     // 1. E-COMMERCE, D2C & RETAIL BRANDS
     if (key.includes('ECOMMERCE') || key.includes('RETAIL') || key.includes('COMMERCE')) {
@@ -838,7 +840,15 @@ Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
     }
 
     // 4. B2B SAAS & TECH ENTERPRISE
-    if (key.includes('SAAS') || key.includes('TECH') || key.includes('SOFTWARE')) {
+    if (
+      key === 'SAAS' ||
+      key.includes('SOFTWARE') ||
+      (key.includes('TECH') &&
+        !key.includes('EDTECH') &&
+        !key.includes('FINTECH') &&
+        !key.includes('PROPTECH') &&
+        !key.includes('MEDTECH'))
+    ) {
       return {
         industry: 'SAAS',
         pods: [
@@ -883,7 +893,14 @@ Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
     }
 
     // 5. HEALTHCARE, TELEMEDICINE & MEDTECH
-    if (key.includes('HEALTH') || key.includes('MEDIS') || key.includes('DOKTER')) {
+    if (
+      key.includes('HEALTH') ||
+      key.includes('MEDIS') ||
+      key.includes('DOKTER') ||
+      key.includes('KLINIK') ||
+      key.includes('RUMAH_SAKIT') ||
+      key.includes('DENTAL')
+    ) {
       return {
         industry: 'HEALTHCARE',
         pods: [
@@ -1210,7 +1227,10 @@ Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
       key.includes('EDU') ||
       key.includes('SEKOLAH') ||
       key.includes('KURSUS') ||
-      key.includes('LEARNING')
+      key.includes('LEARNING') ||
+      key.includes('AKADEMI') ||
+      key.includes('BOOTCAMP') ||
+      key.includes('BIMBEL')
     ) {
       return {
         industry: 'EDTECH',
@@ -1252,20 +1272,31 @@ Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
             recommendedSeats: 1,
           },
         ],
+        defaultServices: [
+          'LMS Platform & Virtual Classrooms',
+          'Tuition Payments, Aid & Billing',
+          'Academic Advising & Tutor Support',
+          'Certification & Degree Verification',
+          'Admissions, Placement & Counseling',
+          'Exam Integrity & Proctoring Support',
+        ],
       };
     }
 
     // 13. CUSTOM / GENERAL (OTHER)
-    const customLabel = customDescription
-      ? ` (${customDescription.slice(0, 15)})`
+    const cleanCustom = (customDescription || '').trim();
+    const customLabel = cleanCustom
+      ? ` (${cleanCustom.slice(0, 20).trim()})`
       : '';
     const otherPods = [
       {
-        name: `Frontline Customer Operations Pod${customLabel}`,
+        name: cleanCustom ? `${cleanCustom.slice(0, 32).trim()} Operations Pod` : 'Frontline Customer Operations Pod',
         category: 'OPERATIONS',
-        description: 'Frontline customer orders, general inquiries, immediate ticket intake',
+        description: cleanCustom
+          ? `Dedicated operational intake and frontline servicing for ${cleanCustom}`
+          : 'Frontline customer orders, general inquiries, immediate ticket intake',
         recommendedSeats: 3,
-        service: customDescription ? `${customDescription.slice(0, 24)} Operations` : 'Frontline Operations & Ticket Triage',
+        service: cleanCustom ? `${cleanCustom.slice(0, 36).trim()} Operations` : 'Frontline Operations & Ticket Triage',
       },
       {
         name: 'Billing, Invoicing & Payment Verification',
