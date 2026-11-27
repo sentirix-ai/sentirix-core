@@ -66,7 +66,7 @@ export class WorkspaceTokenService {
       user.role === 'POD_LEADER' ||
       user.workspaceMembership?.role === 'LEADER' ||
       (user.role as string) === 'LEADER' ||
-      user.role === 'SUPER_ADMIN' ||
+      (user.role as string) === 'TENANT_OWNER' ||
       activeWorkspace.ownerId === user.id;
 
     if (!isLeader) {
@@ -1483,6 +1483,7 @@ export class WorkspaceTokenService {
     oldToken?: string,
     requesterIdentifier?: string,
     workspaceId?: string,
+    actor?: { userId?: string; role?: string; organizationId?: string },
   ) {
     const cleanToken = sanitizeToken(oldToken);
 
@@ -1506,8 +1507,36 @@ export class WorkspaceTokenService {
       throw new NotFoundException('Token not found.');
     }
 
-    // Sovereign Verification: If requesterIdentifier is provided, ensure caller is Super Admin or current active Pod Leader
-    if (requesterIdentifier && requesterIdentifier.trim() !== '') {
+    // Tenant & Role Verification
+    if (actor?.userId && actor.role) {
+      const actorRole = actor.role.toUpperCase();
+      if (actorRole === 'SUPER_ADMIN') {
+        // Allowed across tenants via SuperAdmin module
+      } else if (actorRole === 'TENANT_OWNER' || actorRole === 'ADMIN') {
+        if (
+          !actor.organizationId ||
+          tokenRecord.workspace.organizationId !== actor.organizationId
+        ) {
+          throw new ForbiddenException(
+            'Access denied. Cannot regenerate credentials outside your organization.',
+          );
+        }
+      } else {
+        const membership = await this.prisma.workspaceMember.findFirst({
+          where: {
+            userId: actor.userId,
+            workspaceId: tokenRecord.workspaceId,
+            role: 'LEADER',
+          },
+        });
+        const isWorkspaceOwner = tokenRecord.workspace.ownerId === actor.userId;
+        if (!membership && !isWorkspaceOwner) {
+          throw new ForbiddenException(
+            'Access denied. Only the active Pod Leader or Tenant Owner is authorized to regenerate credentials.',
+          );
+        }
+      }
+    } else if (requesterIdentifier && requesterIdentifier.trim() !== '') {
       const requester = await this.prisma.user.findFirst({
         where: {
           OR: [
@@ -1519,17 +1548,19 @@ export class WorkspaceTokenService {
         include: { workspaceMembership: true },
       });
 
-      const isSuperAdmin =
-        requester?.role === 'SUPER_ADMIN' ||
-        requester?.username?.toLowerCase() === 'pungkyrama';
-
+      const isSuperAdmin = requester?.role === 'SUPER_ADMIN';
+      const isOrgOwner =
+        ((requester?.role as string) === 'TENANT_OWNER' &&
+          !!requester?.organizationId &&
+          requester.organizationId === tokenRecord.workspace.organizationId) ||
+        tokenRecord.workspace.ownerId === requester?.id;
       const isCurrentPodLeader =
         requester?.workspaceMembership?.workspaceId === tokenRecord.workspaceId &&
         requester?.workspaceMembership?.role === 'LEADER';
 
-      if (!isSuperAdmin && !isCurrentPodLeader) {
+      if (!isSuperAdmin && !isOrgOwner && !isCurrentPodLeader) {
         throw new ForbiddenException(
-          'Access denied. Only the active Pod Leader or Super Admin is authorized to regenerate credentials.',
+          'Access denied. Only the active Pod Leader, Tenant Owner, or Super Admin is authorized to regenerate credentials.',
         );
       }
     }

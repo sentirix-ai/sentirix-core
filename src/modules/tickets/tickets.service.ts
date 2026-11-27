@@ -717,7 +717,7 @@ export class TicketsService {
     }
   }
 
-  async cleanupDemoTickets(): Promise<{ count: number }> {
+  async cleanupDemoTickets(organizationId?: string): Promise<{ count: number }> {
     let count = 0;
     try {
       const deleteResult = await this.prisma.ticket.deleteMany({
@@ -725,6 +725,13 @@ export class TicketsService {
           tags: {
             hasSome: ['inbound-portal', 'demo-showcase'],
           },
+          ...(organizationId
+            ? {
+                workspace: {
+                  organizationId,
+                },
+              }
+            : {}),
         },
       });
       count = deleteResult.count;

@@ -10,7 +10,11 @@ import {
 } from '@nestjs/websockets';
 import { Logger } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
-import { parseCorsOrigins } from '../../common/security/crypto.util.js';
+import {
+  parseCorsOrigins,
+  verifyJwt,
+  verifySuperAdminJwt,
+} from '../../common/security/crypto.util.js';
 
 @WebSocketGateway({
   cors: {
@@ -29,6 +33,33 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   handleConnection(client: Socket) {
+    const authToken =
+      typeof client.handshake?.auth?.token === 'string'
+        ? client.handshake.auth.token.trim()
+        : '';
+
+    if (authToken) {
+      const superAdminPayload = verifySuperAdminJwt(authToken);
+      if (superAdminPayload) {
+        void client.join('super_admin');
+        this.logger.log(`Platform Founder WebSocket authenticated: ${client.id}`);
+        return;
+      }
+
+      const tenantPayload = verifyJwt(authToken);
+      if (tenantPayload) {
+        void client.join(`user:${tenantPayload.sub}`);
+        if (tenantPayload.organizationId) {
+          void client.join(`org:${tenantPayload.organizationId}`);
+        }
+        if (tenantPayload.workspaceId) {
+          void client.join(`ws:${tenantPayload.workspaceId}`);
+        }
+        this.logger.log(`Tenant WebSocket authenticated: ${client.id}`);
+        return;
+      }
+    }
+
     this.logger.log(`Client connected: ${client.id}`);
   }
 

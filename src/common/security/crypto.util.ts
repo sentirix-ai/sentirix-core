@@ -1,12 +1,16 @@
 import * as crypto from 'crypto';
 
 const DEFAULT_DEV_JWT_SECRET = 'sevaniq-local-dev-only-fallback-secret-do-not-use-in-prod';
+const DEFAULT_DEV_SUPER_ADMIN_JWT_SECRET =
+  'sevaniq-local-dev-super-admin-only-secret-do-not-use-in-prod';
 
 export interface JwtPayloadInput {
   sub: string;
   username?: string;
   role: string;
   workspaceId?: string;
+  organizationId?: string;
+  scope?: 'TENANT_APP' | 'PLATFORM_FOUNDER';
 }
 
 export interface VerifiedJwtPayload extends JwtPayloadInput {
@@ -82,6 +86,23 @@ export function getJwtSecret(): string {
   return DEFAULT_DEV_JWT_SECRET;
 }
 
+export function getSuperAdminJwtSecret(): string {
+  const configured = process.env.SUPER_ADMIN_JWT_SECRET?.trim();
+  const userSecret = getJwtSecret();
+  if (configured && configured.length >= 16) {
+    if (configured === userSecret && process.env.NODE_ENV === 'production') {
+      throw new Error('SUPER_ADMIN_JWT_SECRET must differ from JWT_SECRET in production.');
+    }
+    return configured;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'SUPER_ADMIN_JWT_SECRET must be configured (min 16 chars) in production.',
+    );
+  }
+  return DEFAULT_DEV_SUPER_ADMIN_JWT_SECRET;
+}
+
 export function parseJwtExpirationSeconds(raw?: string): number {
   const val = (raw || process.env.JWT_EXPIRATION || '7d').trim();
   const match = val.match(/^(\d+)([smhd])?$/i);
@@ -108,7 +129,7 @@ function fromBase64Url(input: string): string {
 }
 
 /**
- * Sign a standard HS256 JWT token using HMAC-SHA256.
+ * Sign a standard HS256 JWT token using HMAC-SHA256 for tenant/staff sessions.
  */
 export function signJwt(
   payload: JwtPayloadInput,
@@ -119,6 +140,7 @@ export function signJwt(
   const ttlSec = parseJwtExpirationSeconds(expiresIn);
   const fullPayload: VerifiedJwtPayload = {
     ...payload,
+    scope: payload.scope ?? 'TENANT_APP',
     iat: nowSec,
     exp: nowSec + ttlSec,
   };
@@ -133,12 +155,25 @@ export function signJwt(
 }
 
 /**
- * Verify an HS256 JWT token signature and expiration timestamp.
+ * Sign an isolated HS256 JWT token for Platform Founder (SUPER_ADMIN) sessions.
  */
-export function verifyJwt(
-  token: string,
-  secret: string = getJwtSecret(),
-): VerifiedJwtPayload | null {
+export function signSuperAdminJwt(
+  payload: Omit<JwtPayloadInput, 'role' | 'scope'>,
+  secret: string = getSuperAdminJwtSecret(),
+  expiresIn: string = process.env.SUPER_ADMIN_JWT_EXPIRATION || '12h',
+): string {
+  return signJwt(
+    {
+      ...payload,
+      role: 'SUPER_ADMIN',
+      scope: 'PLATFORM_FOUNDER',
+    },
+    secret,
+    expiresIn,
+  );
+}
+
+function verifyRawJwt(token: string, secret: string): VerifiedJwtPayload | null {
   if (!token || typeof token !== 'string') return null;
   const parts = token.split('.');
   if (parts.length !== 3) return null;
@@ -168,6 +203,36 @@ export function verifyJwt(
   } catch {
     return null;
   }
+}
+
+/**
+ * Verify a tenant/staff HS256 JWT token signature, scope, and expiration timestamp.
+ */
+export function verifyJwt(
+  token: string,
+  secret: string = getJwtSecret(),
+): VerifiedJwtPayload | null {
+  const payload = verifyRawJwt(token, secret);
+  if (!payload) return null;
+  if (payload.scope === 'PLATFORM_FOUNDER' || payload.role === 'SUPER_ADMIN') {
+    return null;
+  }
+  return payload;
+}
+
+/**
+ * Verify an isolated Platform Founder HS256 JWT token.
+ */
+export function verifySuperAdminJwt(
+  token: string,
+  secret: string = getSuperAdminJwtSecret(),
+): VerifiedJwtPayload | null {
+  const payload = verifyRawJwt(token, secret);
+  if (!payload) return null;
+  if (payload.scope !== 'PLATFORM_FOUNDER' || payload.role !== 'SUPER_ADMIN') {
+    return null;
+  }
+  return payload;
 }
 
 /**

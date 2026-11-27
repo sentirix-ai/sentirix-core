@@ -28,7 +28,7 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary:
-      'Unified login endpoint (accepts username or email, authenticates Admin or regular User)',
+      'Tenant and frontline staff login endpoint (accepts username or work email)',
   })
   @ApiResponse({ status: 200, description: 'Authenticated successfully' })
   async login(@Body() dto: LoginDto): Promise<AuthUserResponse> {
@@ -46,8 +46,7 @@ export class AuthController {
       const isSelf =
         (dto.userId && actor.userId === dto.userId) ||
         (actor.username && actor.username.toLowerCase() === dto.username.trim().toLowerCase());
-      const isSuperAdmin = actor.role === 'SUPER_ADMIN';
-      if (!isSelf && !isSuperAdmin) {
+      if (!isSelf) {
         throw new ForbiddenException('You are not authorized to modify another user profile.');
       }
     }

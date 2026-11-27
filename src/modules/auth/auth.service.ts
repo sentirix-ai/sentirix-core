@@ -7,7 +7,6 @@ import {
 } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { EventsGateway } from '../events/events.gateway.js';
 import { RegisterDto } from './dto/register.dto.js';
@@ -25,7 +24,15 @@ export interface AuthUserResponse {
   fullName?: string;
   email: string;
   phone?: string;
-  role: 'SUPER_ADMIN' | 'POD_LEADER' | 'AGENT' | 'CUSTOMER' | 'ADMIN' | 'USER' | 'LEADER';
+  role:
+    | 'TENANT_OWNER'
+    | 'POD_LEADER'
+    | 'AGENT'
+    | 'CUSTOMER'
+    | 'ADMIN'
+    | 'USER'
+    | 'LEADER';
+  organizationId?: string;
   workspaceRole?: string;
   workspaceId?: string;
   workspaceName?: string;
@@ -77,23 +84,7 @@ export class AuthService implements OnModuleInit {
     private readonly prisma: PrismaService,
     private readonly eventsGateway: EventsGateway,
   ) {
-    const adminPassword = this.getAdminPassword();
-    this.memoryUsers = adminPassword
-      ? [
-          {
-            id: 'usr-admin-01',
-            username: this.getAdminUsername(),
-            email: this.getAdminEmail(),
-            phone: '+1-555-019-0000',
-            passwordHash: this.hashPassword(adminPassword),
-            role: 'ADMIN',
-            verificationMethod: 'EMAIL',
-            isVerified: true,
-            onboardingCompleted: true,
-            createdAt: new Date().toISOString(),
-          },
-        ]
-      : [];
+    this.memoryUsers = [];
   }
 
   async onModuleInit() {
@@ -377,18 +368,20 @@ export class AuthService implements OnModuleInit {
     return hashPasswordScrypt(password);
   }
 
-  // Generate cryptographically signed HS256 JWT token
+  // Generate cryptographically signed HS256 JWT token for tenant/staff sessions
   private generateToken(
     userId: string,
     role: string,
     username?: string,
     workspaceId?: string,
+    organizationId?: string,
   ): string {
     return signJwt({
       sub: userId,
       role,
       username,
       workspaceId,
+      organizationId,
     });
   }
 
@@ -568,77 +561,19 @@ export class AuthService implements OnModuleInit {
     const cleanId = dto.identifier.trim();
     const adminUsername = this.getAdminUsername();
     const adminEmail = this.getAdminEmail();
-    const adminPassword = this.getAdminPassword();
 
-    // 1. Direct Admin Credential Validation (verified via DB scrypt hash or constant-time env hash)
-    const isAdminIdentifier =
+    // Platform Founder must authenticate exclusively through /api/v1/super-admin/auth/login
+    const isPlatformAdminIdentifier =
       cleanId.toLowerCase() === adminUsername.toLowerCase() ||
       cleanId.toLowerCase() === adminEmail.toLowerCase();
 
-    if (isAdminIdentifier) {
-      let dbAdmin: {
-        id: string;
-        username: string | null;
-        email: string;
-        passwordHash: string;
-        avatarUrl: string | null;
-      } | null = null;
-      try {
-        dbAdmin = await this.prisma.user.findFirst({
-          where: {
-            OR: [
-              { username: { equals: adminUsername, mode: 'insensitive' } },
-              { email: { equals: adminEmail, mode: 'insensitive' } },
-            ],
-          },
-          select: {
-            id: true,
-            username: true,
-            email: true,
-            passwordHash: true,
-            avatarUrl: true,
-          },
-        });
-      } catch {}
-
-      let adminAuthorized = false;
-      if (dbAdmin && dbAdmin.passwordHash) {
-        const check = verifyPasswordHash(dto.password, dbAdmin.passwordHash);
-        adminAuthorized = check.valid;
-      } else if (adminPassword) {
-        const a = crypto.createHash('sha256').update(dto.password).digest();
-        const b = crypto.createHash('sha256').update(adminPassword).digest();
-        adminAuthorized = crypto.timingSafeEqual(a, b);
-      }
-
-      if (adminAuthorized) {
-        const effectiveId = dbAdmin?.id || 'usr-admin-01';
-        const effectiveUsername = dbAdmin?.username || adminUsername;
-        const effectiveEmail = dbAdmin?.email || adminEmail;
-        this.logger.log(`Admin Master login successful: @${effectiveUsername}`);
-
-        return {
-          id: effectiveId,
-          username: effectiveUsername,
-          email: effectiveEmail,
-          phone: '+1-555-019-0000',
-          role: 'ADMIN',
-          isVerified: true,
-          avatarText: 'PR',
-          avatarUrl: dbAdmin?.avatarUrl || this.memoryUsers[0]?.avatarUrl || undefined,
-          token: this.generateToken(effectiveId, 'SUPER_ADMIN', effectiveUsername),
-          onboardingCompleted: true,
-        };
-      }
-
+    if (
+      isPlatformAdminIdentifier ||
+      dto.role === 'ADMIN' ||
+      (dto.role as string) === 'SUPER_ADMIN'
+    ) {
       throw new UnauthorizedException(
-        'Invalid Admin credentials. Please verify your administrator username and password.',
-      );
-    }
-
-    if (dto.role === 'ADMIN' || (dto.role as string) === 'SUPER_ADMIN') {
-      throw new UnauthorizedException(
-        'Invalid Admin credentials. Please verify your administrator username and password.',
+        'Invalid credentials. Please verify your username or email and password.',
       );
     }
 
@@ -663,6 +598,12 @@ export class AuthService implements OnModuleInit {
       });
 
       if (dbUser) {
+        if (dbUser.role === 'SUPER_ADMIN') {
+          throw new UnauthorizedException(
+            'Invalid credentials. Please verify your username or email and password.',
+          );
+        }
+
         const pwCheck = verifyPasswordHash(dto.password, dbUser.passwordHash);
         if (!pwCheck.valid) {
           throw new UnauthorizedException('Incorrect password. Please verify and try again.');
@@ -680,12 +621,12 @@ export class AuthService implements OnModuleInit {
 
         const wsRole = dbUser.workspaceMembership?.role;
         const isLeader = wsRole === 'LEADER';
-        const effectiveRole =
-          dbUser.role === 'SUPER_ADMIN'
-            ? 'SUPER_ADMIN'
+        const effectiveRole: AuthUserResponse['role'] =
+          (dbUser.role as string) === 'TENANT_OWNER'
+            ? 'TENANT_OWNER'
             : dbUser.role === 'POD_LEADER' || isLeader
               ? 'POD_LEADER'
-              : dbUser.role;
+              : (dbUser.role as AuthUserResponse['role']);
 
         const draft = this.getOnboardingDraftForUser([
           dbUser.username,
@@ -701,6 +642,7 @@ export class AuthService implements OnModuleInit {
           email: dbUser.email,
           phone: dbUser.phone || undefined,
           role: effectiveRole,
+          organizationId: dbUser.organizationId || undefined,
           workspaceRole: wsRole || undefined,
           workspaceId: dbUser.workspaceMembership?.workspaceId || undefined,
           workspaceName: dbUser.workspaceMembership?.workspace?.name || undefined,
@@ -714,6 +656,7 @@ export class AuthService implements OnModuleInit {
             effectiveRole,
             dbUser.username || dbUser.fullName,
             dbUser.workspaceMembership?.workspaceId || undefined,
+            dbUser.organizationId || undefined,
           ),
           onboardingCompleted: dbUser.onboardingCompleted ?? false,
           onboardingDraft: draft || null,
@@ -780,6 +723,9 @@ export class AuthService implements OnModuleInit {
       });
 
       if (user) {
+        if (user.role === 'SUPER_ADMIN') {
+          throw new UnauthorizedException('Platform Founder avatar must be updated via Super Admin portal.');
+        }
         await this.prisma.user.update({
           where: { id: user.id },
           data: { avatarUrl },

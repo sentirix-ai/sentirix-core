@@ -10,7 +10,7 @@ import { TicketsModule } from './modules/tickets/tickets.module.js';
 import { MessagesModule } from './modules/messages/messages.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
 import { WorkspaceModule } from './modules/workspace/workspace.module.js';
-import { AnalyticsModule } from './modules/analytics/analytics.module.js';
+import { SuperAdminModule } from './modules/super-admin/super-admin.module.js';
 import { JwtAuthGuard } from './common/auth/jwt-auth.guard.js';
 import { RolesGuard } from './common/auth/roles.guard.js';
 
@@ -27,7 +27,7 @@ import { RolesGuard } from './common/auth/roles.guard.js';
     MessagesModule,
     AuthModule,
     WorkspaceModule,
-    AnalyticsModule,
+    SuperAdminModule,
   ],
   controllers: [AppController],
   providers: [

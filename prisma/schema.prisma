@@ -390,6 +390,7 @@ model UserActivitySession {
 
 enum Role {
   SUPER_ADMIN
+  TENANT_OWNER
   POD_LEADER
   AGENT
   CUSTOMER

@@ -457,12 +457,12 @@ export class WorkspaceOnboardingService {
       });
     }
 
-    // 2. Link User to Organization as SUPER_ADMIN (Onboarding will only complete once Done Sharing is clicked)
+    // 2. Link User to Organization as TENANT_OWNER (Onboarding completes once Done Sharing is clicked)
     await this.prisma.user.update({
       where: { id: user.id },
       data: {
         organizationId: organization.id,
-        role: 'SUPER_ADMIN',
+        role: 'TENANT_OWNER',
         onboardingCompleted: false,
       },
     });
@@ -538,7 +538,8 @@ export class WorkspaceOnboardingService {
     const refreshedToken = signJwt({
       sub: user.id,
       username: user.username || undefined,
-      role: 'SUPER_ADMIN',
+      role: 'TENANT_OWNER',
+      organizationId: organization.id,
     });
 
     return {
@@ -686,7 +687,7 @@ export class WorkspaceOnboardingService {
     await this.prisma.user.update({
       where: { id: user.id },
       data: {
-        role: 'SUPER_ADMIN',
+        role: 'TENANT_OWNER',
         onboardingCompleted: true,
       },
     });
@@ -695,11 +696,12 @@ export class WorkspaceOnboardingService {
     if (user.username) this.deleteOnboardingDraft(user.username);
     if (user.email) this.deleteOnboardingDraft(user.email);
 
-    this.logger.log(`User @${user.username} officially completed onboarding into Super Admin Cockpit.`);
+    this.logger.log(`User @${user.username} officially completed onboarding into Company Cockpit.`);
     const refreshedToken = signJwt({
       sub: user.id,
       username: user.username || undefined,
-      role: 'SUPER_ADMIN',
+      role: 'TENANT_OWNER',
+      organizationId: user.organizationId || undefined,
     });
     return { success: true, token: refreshedToken };
   }

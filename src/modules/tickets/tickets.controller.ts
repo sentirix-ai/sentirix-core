@@ -8,6 +8,7 @@ import {
   Patch,
   Post,
   Query,
+  Req,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { TicketsService, TicketRecord } from './tickets.service.js';
@@ -18,6 +19,7 @@ import {
   TransferTicketPodDto,
 } from './dto/ticket.dto.js';
 import { Public, Roles } from '../../common/auth/auth.decorators.js';
+import type { AuthenticatedRequest } from '../../common/auth/jwt-auth.guard.js';
 
 @ApiTags('Tickets')
 @Controller('tickets')
@@ -84,10 +86,10 @@ export class TicketsController {
   }
 
   @ApiBearerAuth()
-  @Roles('ADMIN', 'SUPER_ADMIN')
+  @Roles('TENANT_OWNER')
   @Post('demo/cleanup')
-  @ApiOperation({ summary: 'Clean up all demo showcase tickets' })
-  async cleanupDemo(): Promise<{ count: number }> {
-    return this.ticketsService.cleanupDemoTickets();
+  @ApiOperation({ summary: 'Clean up demo showcase tickets within your organization' })
+  async cleanupDemo(@Req() req: AuthenticatedRequest): Promise<{ count: number }> {
+    return this.ticketsService.cleanupDemoTickets(req.user?.organizationId);
   }
 }

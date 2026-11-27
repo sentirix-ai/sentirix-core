@@ -22,14 +22,18 @@ export class WorkspaceController {
 
   /**
    * Get or create workspace for a registered regular user
-   * (Admin @pungkyrama is strictly rejected with 403 Forbidden)
+   * (Platform Founder is strictly rejected with 403 Forbidden)
    */
   @Get('my-workspace')
-  async getMyWorkspace(@Query('identifier') identifier: string) {
-    if (!identifier || identifier.trim() === '') {
+  async getMyWorkspace(
+    @Req() req: AuthenticatedRequest,
+    @Query('identifier') identifier?: string,
+  ) {
+    const effectiveIdentifier = identifier?.trim() || req.user?.username || req.user?.userId;
+    if (!effectiveIdentifier) {
       throw new BadRequestException('User identifier is required.');
     }
-    return this.workspaceService.getOrCreateUserWorkspace(identifier);
+    return this.workspaceService.getOrCreateUserWorkspace(effectiveIdentifier);
   }
 
   /**
@@ -296,19 +300,18 @@ export class WorkspaceController {
   }
 
   /**
-   * Get Super Admin Executive Cockpit Data
+   * Get Tenant Owner Company Cockpit Data (strictly scoped to caller's organization)
    */
-  @Roles('ADMIN', 'SUPER_ADMIN')
-  @Get('super-admin-cockpit')
-  async getSuperAdminCockpit(
-    @Req() req: AuthenticatedRequest,
-    @Query('identifier') identifier?: string,
-  ) {
-    const effectiveIdentifier = req.user?.username || identifier;
-    if (!effectiveIdentifier) {
-      throw new BadRequestException('Administrator identifier is required.');
+  @Roles('TENANT_OWNER')
+  @Get('cockpit')
+  async getCompanyCockpit(@Req() req: AuthenticatedRequest) {
+    if (!req.user?.userId) {
+      throw new BadRequestException('Authenticated Tenant Owner is required.');
     }
-    return this.workspaceService.getSuperAdminCockpitData(effectiveIdentifier);
+    return this.workspaceService.getCompanyCockpitData(
+      req.user.userId,
+      req.user.organizationId,
+    );
   }
 
   /**
@@ -377,6 +380,13 @@ export class WorkspaceController {
     @Body() body: { token?: string; identifier?: string; workspaceId?: string },
   ) {
     const verifiedIdentifier = req.user?.username || body.identifier;
+    const actor = req.user
+      ? {
+          userId: req.user.userId,
+          role: req.user.role,
+          organizationId: req.user.organizationId,
+        }
+      : undefined;
     if (
       (body?.token && body.token.trim() !== '') ||
       (body?.workspaceId && body.workspaceId.trim() !== '')
@@ -385,6 +395,7 @@ export class WorkspaceController {
         body.token,
         verifiedIdentifier,
         body.workspaceId,
+        actor,
       );
     }
     if (verifiedIdentifier && verifiedIdentifier.trim() !== '') {
@@ -400,47 +411,53 @@ export class WorkspaceController {
   }
 
   /**
-   * Super Admin Sovereign Session Revocation (Force Logout)
+   * Tenant Owner Session Revocation (Force Logout within own organization)
    */
-  @Roles('ADMIN', 'SUPER_ADMIN')
+  @Roles('TENANT_OWNER')
   @Post('force-logout')
   async forceLogout(
+    @Req() req: AuthenticatedRequest,
     @Body()
     body: {
       userId?: string;
       username?: string;
       token?: string;
-      requesterIdentifier?: string;
     },
   ) {
     return this.workspaceService.forceLogoutUser(
       body?.userId,
       body?.username,
       body?.token,
-      body?.requesterIdentifier,
+      req.user?.organizationId,
     );
   }
 
   /**
-   * Super Admin Authority: Rename Leader or Member Personnel
+   * Tenant Owner Authority: Rename Leader or Member Personnel
    */
-  @Roles('ADMIN', 'SUPER_ADMIN')
+  @Roles('TENANT_OWNER')
   @Post('rename-personnel')
   async renamePersonnel(
+    @Req() req: AuthenticatedRequest,
     @Body() body: { userId: string; newFullName: string },
   ) {
     if (!body?.userId || !body?.newFullName?.trim()) {
       throw new BadRequestException('userId and newFullName are required.');
     }
-    return this.workspaceService.renamePersonnel(body.userId, body.newFullName);
+    return this.workspaceService.renamePersonnel(
+      body.userId,
+      body.newFullName,
+      req.user?.organizationId,
+    );
   }
 
   /**
-   * Super Admin Authority: Transfer / Reassign Personnel Across Pods (Mutasi Kerja)
+   * Tenant Owner Authority: Transfer / Reassign Personnel Across Pods (Mutasi Kerja)
    */
-  @Roles('ADMIN', 'SUPER_ADMIN')
+  @Roles('TENANT_OWNER')
   @Post('transfer-personnel')
   async transferPersonnel(
+    @Req() req: AuthenticatedRequest,
     @Body()
     body: {
       userId: string;
@@ -453,43 +470,46 @@ export class WorkspaceController {
         'userId and targetWorkspaceId are required.',
       );
     }
-    return this.workspaceService.transferPersonnel(body);
+    return this.workspaceService.transferPersonnel(body, req.user?.organizationId);
   }
 
   /**
-   * Super Admin Authority: Promote an Agent to Leader in the same Pod (Role Switch)
+   * Tenant Owner Authority: Promote an Agent to Leader in the same Pod (Role Switch)
    */
-  @Roles('ADMIN', 'SUPER_ADMIN')
+  @Roles('TENANT_OWNER')
   @Post('promote-leader')
   async promoteLeader(
+    @Req() req: AuthenticatedRequest,
     @Body() body: { userId: string; workspaceId: string },
   ) {
     if (!body?.userId || !body?.workspaceId) {
       throw new BadRequestException('userId and workspaceId are required.');
     }
-    return this.workspaceService.promoteToLeader(body);
+    return this.workspaceService.promoteToLeader(body, req.user?.organizationId);
   }
 
   /**
-   * Super Admin Authority: 1-to-1 Cross-Pod Swap (Strict Fixed Capacity)
+   * Tenant Owner Authority: 1-to-1 Cross-Pod Swap (Strict Fixed Capacity)
    */
-  @Roles('ADMIN', 'SUPER_ADMIN')
+  @Roles('TENANT_OWNER')
   @Post('swap-personnel')
   async swapPersonnel(
+    @Req() req: AuthenticatedRequest,
     @Body() body: { userAId: string; userBId: string },
   ) {
     if (!body?.userAId || !body?.userBId) {
       throw new BadRequestException('userAId and userBId are required.');
     }
-    return this.workspaceService.swapPersonnel(body);
+    return this.workspaceService.swapPersonnel(body, req.user?.organizationId);
   }
 
   /**
-   * Super Admin Monetization & Expansion: Deploy a Specialized Pod ($149/mo)
+   * Tenant Owner Expansion: Deploy a Specialized Pod ($149/mo)
    */
-  @Roles('ADMIN', 'SUPER_ADMIN')
+  @Roles('TENANT_OWNER')
   @Post('create-pod')
   async createPod(
+    @Req() req: AuthenticatedRequest,
     @Body()
     body: {
       name: string;
@@ -504,15 +524,20 @@ export class WorkspaceController {
     if (!body?.name?.trim()) {
       throw new BadRequestException('Pod name is required.');
     }
-    return this.workspaceService.createSpecializedPod(body);
+    return this.workspaceService.createSpecializedPod(
+      body,
+      req.user?.userId,
+      req.user?.organizationId,
+    );
   }
 
   /**
-   * Super Admin Monetization & Expansion: Add Frontline Seats to a Pod (+$30/seat/mo)
+   * Tenant Owner Expansion: Add Frontline Seats to a Pod (+$30/seat/mo)
    */
-  @Roles('ADMIN', 'SUPER_ADMIN')
+  @Roles('TENANT_OWNER')
   @Post('add-seat')
   async addSeat(
+    @Req() req: AuthenticatedRequest,
     @Body()
     body: {
       workspaceId: string;
@@ -522,7 +547,7 @@ export class WorkspaceController {
     if (!body?.workspaceId) {
       throw new BadRequestException('workspaceId is required.');
     }
-    return this.workspaceService.addSeatToPod(body);
+    return this.workspaceService.addSeatToPod(body, req.user?.organizationId);
   }
 }
 

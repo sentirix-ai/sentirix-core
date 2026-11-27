@@ -40,6 +40,19 @@ async function main() {
     },
   });
 
+  await prisma.platformFounderProfile.upsert({
+    where: { userId: admin.id },
+    update: {
+      systemTitle: 'Platform Founder & System Sovereign',
+      crownBadge: 'GOLD_CROWN_PLATFORM_SOVEREIGN',
+    },
+    create: {
+      userId: admin.id,
+      systemTitle: 'Platform Founder & System Sovereign',
+      crownBadge: 'GOLD_CROWN_PLATFORM_SOVEREIGN',
+    },
+  });
+
   // 2. Seed Knowledge Base Article (no regular user accounts created by default)
   const existingKB = await prisma.knowledgeArticle.findFirst();
   if (!existingKB) {

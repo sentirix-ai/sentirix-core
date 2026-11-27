@@ -8,11 +8,13 @@ function createPrismaWorkspaceMock() {
   return {
     user: {
       findFirst: vi.fn(),
+      findUnique: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
     },
     workspace: {
       findFirst: vi.fn(),
+      findUnique: vi.fn(),
       findMany: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
@@ -349,6 +351,31 @@ describe('WorkspaceService', () => {
           usedBy: 'Agent A',
         }),
       });
+    });
+
+    it('blocks TENANT_OWNER from mutating personnel or pods in another organization (403 IDOR guard)', async () => {
+      prismaMock.user.findUnique.mockResolvedValue({
+        id: 'usr-other-org',
+        role: 'AGENT',
+        organizationId: 'org-B',
+        workspaceMembership: { workspace: { organizationId: 'org-B' } },
+      });
+
+      await expect(
+        service.renamePersonnel('usr-other-org', 'Tampered Name', 'org-A'),
+      ).rejects.toThrow(ForbiddenException);
+
+      prismaMock.workspace.findUnique.mockResolvedValue({
+        id: 'ws-other-org',
+        organizationId: 'org-B',
+        assignedQuota: 4,
+        members: [],
+        inviteTokens: [],
+      });
+
+      await expect(
+        service.addSeatToPod({ workspaceId: 'ws-other-org', seatCount: 1 }, 'org-A'),
+      ).rejects.toThrow(ForbiddenException);
     });
   });
 });

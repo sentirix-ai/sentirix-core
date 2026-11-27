@@ -137,7 +137,7 @@ describe('AuthService', () => {
     ).rejects.toThrow(UnauthorizedException);
   });
 
-  it('rejects invalid admin credentials when role is ADMIN', async () => {
+  it('rejects Admin/Super Admin login attempts on the regular user login endpoint', async () => {
     await expect(
       service.login({
         identifier: 'attacker',
@@ -145,56 +145,57 @@ describe('AuthService', () => {
         role: 'ADMIN',
       }),
     ).rejects.toThrow(UnauthorizedException);
+
+    await expect(
+      service.login({
+        identifier: 'pungkyrama',
+        password: 'SomePassword@123',
+        role: 'USER',
+      }),
+    ).rejects.toThrow(UnauthorizedException);
+
+    prismaMock.user.findFirst.mockResolvedValue({
+      id: 'usr-admin-01',
+      username: 'custom_founder',
+      email: 'founder@sevaniq.enterprise',
+      role: 'SUPER_ADMIN',
+      passwordHash: service.hashPassword('StrongRandomAdmin#2026!'),
+    });
+
+    await expect(
+      service.login({
+        identifier: 'custom_founder',
+        password: 'StrongRandomAdmin#2026!',
+        role: 'USER',
+      }),
+    ).rejects.toThrow(UnauthorizedException);
   });
 
-  it('rejects legacy hardcoded admin password and verifies Super Admin via database scrypt hash', async () => {
-    const originalAdminPass = process.env.ADMIN_PASSWORD;
-    delete process.env.ADMIN_PASSWORD;
-    try {
-      const noEnvService = new AuthService(
-        prismaMock as unknown as PrismaService,
-        createEventsMock(),
-      );
-      prismaMock.user.findFirst.mockResolvedValue(null);
+  it('authenticates TENANT_OWNER with organizationId scope in JWT', async () => {
+    const storedHash = service.hashPassword('OwnerPass@123');
+    prismaMock.user.findFirst.mockResolvedValue({
+      id: 'usr-owner-1',
+      username: 'acme_owner',
+      fullName: 'Acme Owner',
+      email: 'owner@acme.com',
+      phone: '+1-555-0188',
+      passwordHash: storedHash,
+      role: 'TENANT_OWNER',
+      organizationId: 'org-acme-1',
+      verificationMethod: 'EMAIL',
+      onboardingCompleted: true,
+      avatarUrl: null,
+      workspaceMembership: null,
+    });
 
-      // Must reject legacy leaked password when no DB hash / ADMIN_PASSWORD exists
-      await expect(
-        noEnvService.login({
-          identifier: 'pungkyrama',
-          password: '0o0o 0o0o',
-          role: 'ADMIN',
-        }),
-      ).rejects.toThrow(UnauthorizedException);
+    const res = await service.login({
+      identifier: 'owner@acme.com',
+      password: 'OwnerPass@123',
+      role: 'USER',
+    });
 
-      // Must authenticate against hashed database record and reject wrong password
-      const strongPass = 'StrongRandomAdmin#2026!';
-      prismaMock.user.findFirst.mockResolvedValue({
-        id: 'usr-admin-01',
-        username: 'pungkyrama',
-        email: 'admin@sevaniq.enterprise',
-        passwordHash: noEnvService.hashPassword(strongPass),
-        avatarUrl: null,
-      });
-
-      const ok = await noEnvService.login({
-        identifier: 'pungkyrama',
-        password: strongPass,
-        role: 'ADMIN',
-      });
-      expect(ok.username).toBe('pungkyrama');
-      expect(ok.token).toBeTruthy();
-
-      await expect(
-        noEnvService.login({
-          identifier: 'pungkyrama',
-          password: '0o0o 0o0o',
-          role: 'ADMIN',
-        }),
-      ).rejects.toThrow(UnauthorizedException);
-    } finally {
-      if (originalAdminPass !== undefined) {
-        process.env.ADMIN_PASSWORD = originalAdminPass;
-      }
-    }
+    expect(res.role).toBe('TENANT_OWNER');
+    expect(res.organizationId).toBe('org-acme-1');
+    expect(res.token).toBeTruthy();
   });
 });

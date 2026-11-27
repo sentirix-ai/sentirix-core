@@ -37,12 +37,14 @@ jobs:
         env:
           NODE_ENV: test
           JWT_SECRET: "ci-test-secret-minimum-32-characters-long"
+          SUPER_ADMIN_JWT_SECRET: "ci-test-super-admin-secret-minimum-32-chars"
 
       - name: E2E RBAC & Validation Tests
         run: npm run test:e2e
         env:
           NODE_ENV: test
           JWT_SECRET: "ci-test-secret-minimum-32-characters-long"
+          SUPER_ADMIN_JWT_SECRET: "ci-test-super-admin-secret-minimum-32-chars"
 
       - name: Typecheck & Production Build
         run: npm run build

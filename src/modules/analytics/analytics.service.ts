@@ -52,7 +52,7 @@ export class AnalyticsService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * Asserts that the requester is Master Admin (@pungkyrama)
+   * Asserts that the requester is Platform Founder (SUPER_ADMIN)
    */
   assertAdmin(identifier?: string) {
     const clean = identifier?.toLowerCase().trim();
@@ -65,8 +65,13 @@ export class AnalyticsService {
     }
   }
 
-  async getOwnerDashboardData(identifier?: string): Promise<OwnerAnalyticsResponse> {
-    this.assertAdmin(identifier);
+  async getOwnerDashboardData(
+    identifier?: string,
+    options?: { verifiedSuperAdmin?: boolean },
+  ): Promise<OwnerAnalyticsResponse> {
+    if (!options?.verifiedSuperAdmin) {
+      this.assertAdmin(identifier);
+    }
 
     // 1. Fetch Users excluding master admin
     const adminUsername = (process.env.ADMIN_USERNAME || 'pungkyrama').trim();

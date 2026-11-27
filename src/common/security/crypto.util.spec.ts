@@ -5,6 +5,8 @@ import {
   verifyPasswordHash,
   signJwt,
   verifyJwt,
+  signSuperAdminJwt,
+  verifySuperAdminJwt,
   parseCorsOrigins,
 } from './crypto.util.js';
 
@@ -59,6 +61,26 @@ describe('Security Utilities (crypto.util)', () => {
       JSON.stringify({ sub: 'usr-42', role: 'SUPER_ADMIN', iat: 1, exp: 9999999999 }),
     ).toString('base64url');
     expect(verifyJwt(`${parts[0]}.${forgedPayload}.${parts[2]}`, secret)).toBeNull();
+  });
+
+  it('isolates Super Admin JWT tokens from regular tenant JWT verification', () => {
+    const userSecret = 'tenant-user-secret-key-minimum-32-chars';
+    const adminSecret = 'super-admin-secret-key-minimum-32-chars';
+
+    const adminToken = signSuperAdminJwt(
+      { sub: 'usr-admin-01', username: 'founder' },
+      adminSecret,
+    );
+    const tenantForgedAsAdmin = signJwt(
+      { sub: 'usr-1', username: 'tenant', role: 'SUPER_ADMIN' },
+      userSecret,
+    );
+
+    expect(verifySuperAdminJwt(adminToken, adminSecret)?.sub).toBe('usr-admin-01');
+    expect(verifyJwt(adminToken, userSecret)).toBeNull();
+    expect(verifyJwt(adminToken, adminSecret)).toBeNull();
+    expect(verifySuperAdminJwt(tenantForgedAsAdmin, adminSecret)).toBeNull();
+    expect(verifyJwt(tenantForgedAsAdmin, userSecret)).toBeNull();
   });
 
   it('parses CORS_ORIGIN into an allowlist or wildcard', () => {

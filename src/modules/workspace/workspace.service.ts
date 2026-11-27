@@ -114,7 +114,7 @@ export class WorkspaceService {
       throw new NotFoundException(`User ${identifier} not found.`);
     }
 
-    if (user.role === 'SUPER_ADMIN' || user.username === 'pungkyrama') {
+    if (user.role === 'SUPER_ADMIN') {
       throw new ForbiddenException('Super Admin accounts are excluded from workspace team links.');
     }
 
@@ -329,8 +329,13 @@ export class WorkspaceService {
     return this.tokenService.claimAgentToken(dto);
   }
 
-  regenerateToken(oldToken?: string, identifier?: string, workspaceId?: string) {
-    return this.tokenService.regenerateToken(oldToken, identifier, workspaceId);
+  regenerateToken(
+    oldToken?: string,
+    identifier?: string,
+    workspaceId?: string,
+    actor?: { userId?: string; role?: string; organizationId?: string },
+  ) {
+    return this.tokenService.regenerateToken(oldToken, identifier, workspaceId, actor);
   }
 
   setupCapacity(identifier: string, capacity: number) {
@@ -392,40 +397,56 @@ export class WorkspaceService {
     return this.personnelService.removeMember(ownerIdentifier, memberId);
   }
 
-  getSuperAdminCockpitData(identifier: string) {
-    return this.personnelService.getSuperAdminCockpitData(identifier);
+  getCompanyCockpitData(actorUserId: string, actorOrganizationId?: string) {
+    return this.personnelService.getCompanyCockpitData(actorUserId, actorOrganizationId);
   }
 
-  renamePersonnel(userId: string, newFullName: string) {
-    return this.personnelService.renamePersonnel(userId, newFullName);
+  renamePersonnel(userId: string, newFullName: string, actorOrganizationId?: string) {
+    return this.personnelService.renamePersonnel(userId, newFullName, actorOrganizationId);
   }
 
-  transferPersonnel(dto: Parameters<WorkspacePersonnelService['transferPersonnel']>[0]) {
-    return this.personnelService.transferPersonnel(dto);
+  transferPersonnel(
+    dto: Parameters<WorkspacePersonnelService['transferPersonnel']>[0],
+    actorOrganizationId?: string,
+  ) {
+    return this.personnelService.transferPersonnel(dto, actorOrganizationId);
   }
 
-  promoteToLeader(dto: Parameters<WorkspacePersonnelService['promoteToLeader']>[0]) {
-    return this.personnelService.promoteToLeader(dto);
+  promoteToLeader(
+    dto: Parameters<WorkspacePersonnelService['promoteToLeader']>[0],
+    actorOrganizationId?: string,
+  ) {
+    return this.personnelService.promoteToLeader(dto, actorOrganizationId);
   }
 
-  swapPersonnel(dto: Parameters<WorkspacePersonnelService['swapPersonnel']>[0]) {
-    return this.personnelService.swapPersonnel(dto);
+  swapPersonnel(
+    dto: Parameters<WorkspacePersonnelService['swapPersonnel']>[0],
+    actorOrganizationId?: string,
+  ) {
+    return this.personnelService.swapPersonnel(dto, actorOrganizationId);
   }
 
-  createSpecializedPod(dto: Parameters<WorkspacePersonnelService['createSpecializedPod']>[0]) {
-    return this.personnelService.createSpecializedPod(dto);
+  createSpecializedPod(
+    dto: Parameters<WorkspacePersonnelService['createSpecializedPod']>[0],
+    actorUserId?: string,
+    actorOrganizationId?: string,
+  ) {
+    return this.personnelService.createSpecializedPod(dto, actorUserId, actorOrganizationId);
   }
 
-  addSeatToPod(dto: Parameters<WorkspacePersonnelService['addSeatToPod']>[0]) {
-    return this.personnelService.addSeatToPod(dto);
+  addSeatToPod(
+    dto: Parameters<WorkspacePersonnelService['addSeatToPod']>[0],
+    actorOrganizationId?: string,
+  ) {
+    return this.personnelService.addSeatToPod(dto, actorOrganizationId);
   }
 
   forceLogoutUser(
     userId?: string,
     username?: string,
     token?: string,
-    requesterIdentifier?: string,
+    actorOrganizationId?: string,
   ) {
-    return this.personnelService.forceLogoutUser(userId, username, token, requesterIdentifier);
+    return this.personnelService.forceLogoutUser(userId, username, token, actorOrganizationId);
   }
 }

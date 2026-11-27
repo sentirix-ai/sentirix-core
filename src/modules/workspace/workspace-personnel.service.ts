@@ -6,9 +6,31 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import * as crypto from 'crypto';
+import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { EventsGateway } from '../events/events.gateway.js';
 import { assertNotAdmin } from './workspace.shared.js';
+
+const COCKPIT_ORG_INCLUDE = {
+  workspaces: {
+    include: {
+      members: { include: { user: true } },
+      tickets: {
+        include: {
+          messages: {
+            orderBy: { createdAt: 'asc' as const },
+          },
+        },
+      },
+      inviteTokens: { orderBy: { createdAt: 'desc' as const } },
+    },
+    orderBy: { createdAt: 'asc' as const },
+  },
+} satisfies Prisma.OrganizationInclude;
+
+type CockpitOrganization = Prisma.OrganizationGetPayload<{
+  include: typeof COCKPIT_ORG_INCLUDE;
+}>;
 
 /** Manages Super Admin cockpit telemetry, personnel transfers, pod scaling, and session revocation. */
 @Injectable()
@@ -331,99 +353,113 @@ export class WorkspacePersonnelService {
     return { success: true, message: 'Member removed successfully.' };
   }
 
+  private assertOrganizationScope(
+    actorOrgId: string | undefined,
+    targetOrgId: string | null | undefined,
+  ): void {
+    if (actorOrgId === undefined) return;
+    if (!actorOrgId || !targetOrgId || actorOrgId !== targetOrgId) {
+      throw new ForbiddenException(
+        'Access denied. You cannot manage personnel or pods outside your organization.',
+      );
+    }
+  }
+
   /**
-   * Super Admin Executive Control Cockpit Data
+   * Tenant Owner Company Cockpit Data (strictly scoped to the authenticated owner's organization)
    */
-  async getSuperAdminCockpitData(identifier: string) {
-    const user = await this.prisma.user.findFirst({
-      where: {
-        OR: [
-          { id: identifier },
-          { username: { equals: identifier, mode: 'insensitive' } },
-          { email: { equals: identifier, mode: 'insensitive' } },
-        ],
-      },
+  async getCompanyCockpitData(actorUserId: string, actorOrganizationId?: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: actorUserId },
       include: {
         organization: {
-          include: {
-            workspaces: {
-              include: {
-                members: { include: { user: true } },
-                tickets: {
-                  include: {
-                    messages: {
-                      orderBy: { createdAt: 'asc' },
-                    },
-                  },
-                },
-                inviteTokens: { orderBy: { createdAt: 'desc' } },
-              },
-              orderBy: { createdAt: 'asc' },
-            },
-          },
+          include: COCKPIT_ORG_INCLUDE,
         },
       },
     });
 
-    let org = user?.organization;
-    if (!org && user) {
-      // Prioritize active business organizations (e.g. non-healthcare or latest active tenant)
+    if (!user) {
+      throw new NotFoundException('Authenticated user not found.');
+    }
+    if (user.role === 'SUPER_ADMIN') {
+      throw new ForbiddenException(
+        'Platform Founder must use the isolated Super Admin control plane.',
+      );
+    }
+
+    let org = user.organization;
+    if (!org && actorOrganizationId) {
+      org = await this.prisma.organization.findUnique({
+        where: { id: actorOrganizationId },
+        include: COCKPIT_ORG_INCLUDE,
+      });
+    }
+
+    if (!org) {
+      throw new NotFoundException('Organization not found for this Tenant Owner.');
+    }
+
+    return this.buildCockpitPayload(org, user);
+  }
+
+  /**
+   * Cross-Tenant Platform Founder Cockpit Inspection (used exclusively by SuperAdminModule)
+   */
+  async getCrossTenantCockpitData(organizationId?: string) {
+    let org = organizationId
+      ? await this.prisma.organization.findUnique({
+          where: { id: organizationId },
+          include: COCKPIT_ORG_INCLUDE,
+        })
+      : await this.prisma.organization.findFirst({
+          where: { NOT: { industry: 'HEALTHCARE' } },
+          include: COCKPIT_ORG_INCLUDE,
+          orderBy: { createdAt: 'desc' },
+        });
+
+    if (!org && !organizationId) {
       org = await this.prisma.organization.findFirst({
-        where: {
-          NOT: { industry: 'HEALTHCARE' },
-        },
-        include: {
-          workspaces: {
-            include: {
-              members: { include: { user: true } },
-              tickets: {
-                include: {
-                  messages: {
-                    orderBy: { createdAt: 'asc' },
-                  },
-                },
-              },
-              inviteTokens: { orderBy: { createdAt: 'desc' } },
-            },
-            orderBy: { createdAt: 'asc' },
-          },
-        },
+        include: COCKPIT_ORG_INCLUDE,
         orderBy: { createdAt: 'desc' },
       });
-
-      if (!org) {
-        org = await this.prisma.organization.findFirst({
-          include: {
-            workspaces: {
-              include: {
-                members: { include: { user: true } },
-                tickets: {
-                  include: {
-                    messages: {
-                      orderBy: { createdAt: 'asc' },
-                    },
-                  },
-                },
-                inviteTokens: { orderBy: { createdAt: 'desc' } },
-              },
-              orderBy: { createdAt: 'asc' },
-            },
-          },
-        });
-      }
-
-      // Do NOT attach organizationId to platform owner (@pungkyrama)
-      if (org && user.id && user.username?.toLowerCase() !== 'pungkyrama') {
-        await this.prisma.user.update({
-          where: { id: user.id },
-          data: { organizationId: org.id },
-        });
-      }
     }
 
-    if (!user || !org) {
-      throw new NotFoundException('Organization not found for this administrator.');
+    if (!org) {
+      if (organizationId) {
+        throw new NotFoundException(`Organization ${organizationId} not found.`);
+      }
+      return {
+        organization: null,
+        stats: {
+          totalSeats: 0,
+          claimedSeats: 0,
+          seatUtilizationPercentage: 0,
+          totalPods: 0,
+          lockedPods: 0,
+          crisisCount: 0,
+          onlineCount: 0,
+          slaCompliancePercentage: 100,
+          slaStatusLabel: 'Optimal',
+          slaMetCount: 0,
+          slaBreachedCount: 0,
+          totalEvaluatedTickets: 0,
+        },
+        workspaces: [],
+        tokenAudit: [],
+        crisisTickets: [],
+        slaBreachedTickets: [],
+        presenceMonitoring: [],
+        recentLeaderActivations: [],
+      };
     }
+
+    return this.buildCockpitPayload(org, null);
+  }
+
+  private async buildCockpitPayload(
+    org: CockpitOrganization,
+    actorUser: { id: string; onboardingCompleted?: boolean | null } | null,
+  ) {
     const workspaces = org.workspaces || [];
     const now = Date.now();
 
@@ -546,13 +582,11 @@ export class WorkspacePersonnelService {
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
 
-    // Query presence and activity sessions for Leader & Member monitoring
+    // Query presence and activity sessions for Leader & Member monitoring within this organization
     const allOrgUsers = await this.prisma.user.findMany({
       where: {
-        OR: [
-          { organizationId: org.id },
-          { id: user.id },
-        ],
+        organizationId: org.id,
+        role: { not: 'SUPER_ADMIN' },
       },
       include: {
         workspaceMembership: {
@@ -579,14 +613,15 @@ export class WorkspacePersonnelService {
     });
 
     const presenceList = allOrgUsers.map((u) => {
-      const isSuperAdmin = u.role === 'SUPER_ADMIN' || u.id === user.id;
+      const isTenantOwner =
+        (u.role as string) === 'TENANT_OWNER' || (actorUser ? u.id === actorUser.id : false);
       const isLeader = u.workspaceMembership
         ? u.workspaceMembership.role === 'LEADER'
         : u.role === 'POD_LEADER';
-      const userRole = isSuperAdmin ? 'SUPER_ADMIN' : isLeader ? 'LEADER' : 'MEMBER';
+      const userRole = isTenantOwner ? 'TENANT_OWNER' : isLeader ? 'LEADER' : 'MEMBER';
       const podName =
         u.workspaceMembership?.workspace?.name ||
-        (isSuperAdmin ? 'Executive Cockpit' : 'Unassigned');
+        (isTenantOwner ? 'Company Cockpit' : 'Unassigned');
 
       const allAssigned = (u as any).assignedTickets || [];
       const activeTickets = allAssigned.filter(
@@ -638,7 +673,7 @@ export class WorkspacePersonnelService {
 
       const customersServedToday = realServedToday > 0 ? realServedToday : (seed ? seed.today : 0);
       const lifetimeCustomersServed = realLifetimeServed > 0 ? realLifetimeServed : (seed ? seed.lifetime : 0);
-      const avgHandlingTimeSeconds = realAhtSec > 0 ? realAhtSec : (seed ? seed.ahtSec : (isSuperAdmin ? 0 : 660));
+      const avgHandlingTimeSeconds = realAhtSec > 0 ? realAhtSec : (seed ? seed.ahtSec : (isTenantOwner ? 0 : 660));
 
       // Filter out instant ghost sessions (e.g. sessions created and closed within < 5s with SESI_BARU_DIMULAI)
       const validActivitySessions = u.activitySessions.filter((sess) => {
@@ -673,10 +708,10 @@ export class WorkspacePersonnelService {
       let operationalStateLabel = 'Standby (Ready)';
       let workloadDescription = 'Ready to Receive Tickets';
 
-      if (isSuperAdmin) {
+      if (isTenantOwner) {
         operationalState = 'EXECUTIVE_SUPERVISION';
         operationalStateLabel = 'Executive Supervision';
-        workloadDescription = 'Central Organization Command';
+        workloadDescription = 'Company Organization Command';
       } else if (isActuallyOnline) {
         if (activeTicketsCount > 0) {
           operationalState = 'SERVING';
@@ -950,7 +985,7 @@ export class WorkspacePersonnelService {
         totalSeats: effectiveTotalSeats,
         planTier: org.planTier,
         leadershipMode: org.leadershipMode,
-        onboardingCompleted: user.onboardingCompleted ?? false,
+        onboardingCompleted: actorUser?.onboardingCompleted ?? true,
       },
       stats: {
         totalSeats: effectiveTotalSeats,
@@ -962,7 +997,9 @@ export class WorkspacePersonnelService {
         totalPods: workspaces.length,
         lockedPods: totalLockedPods,
         crisisCount: crisisTickets.length,
-        onlineCount: presenceList.filter((p) => p.role !== 'SUPER_ADMIN' && p.isOnline).length,
+        onlineCount: presenceList.filter(
+          (p) => p.role !== 'SUPER_ADMIN' && p.role !== 'TENANT_OWNER' && p.isOnline,
+        ).length,
         slaCompliancePercentage,
         slaStatusLabel,
         slaMetCount,
@@ -980,9 +1017,13 @@ export class WorkspacePersonnelService {
 
 
   /**
-   * Super Admin Authority: Rename Leader or Member
+   * Tenant Owner Authority: Rename Leader or Member Personnel
    */
-  async renamePersonnel(userId: string, newFullName: string) {
+  async renamePersonnel(
+    userId: string,
+    newFullName: string,
+    actorOrganizationId?: string,
+  ) {
     if (!userId || !newFullName || newFullName.trim() === '') {
       throw new BadRequestException('User ID and valid new full name are required.');
     }
@@ -990,11 +1031,23 @@ export class WorkspacePersonnelService {
     const cleanName = newFullName.trim();
     const existing = await this.prisma.user.findUnique({
       where: { id: userId },
+      include: {
+        workspaceMembership: {
+          include: { workspace: true },
+        },
+      },
     });
 
     if (!existing) {
       throw new NotFoundException(`User with ID ${userId} not found.`);
     }
+    if (existing.role === 'SUPER_ADMIN') {
+      throw new ForbiddenException('Cannot modify Platform Founder account.');
+    }
+    this.assertOrganizationScope(
+      actorOrganizationId,
+      existing.organizationId || existing.workspaceMembership?.workspace?.organizationId,
+    );
 
     const previousName = existing.fullName;
     const updated = await this.prisma.user.update({
@@ -1026,13 +1079,16 @@ export class WorkspacePersonnelService {
   }
 
   /**
-   * Super Admin Authority: Transfer / Reassign Personnel Across Pods (Mutasi Kerja)
+   * Tenant Owner Authority: Transfer / Reassign Personnel Across Pods (Mutasi Kerja)
    */
-  async transferPersonnel(dto: {
-    userId: string;
-    targetWorkspaceId: string;
-    targetRole?: string;
-  }) {
+  async transferPersonnel(
+    dto: {
+      userId: string;
+      targetWorkspaceId: string;
+      targetRole?: string;
+    },
+    actorOrganizationId?: string,
+  ) {
     const { userId, targetWorkspaceId, targetRole } = dto;
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
@@ -1046,6 +1102,9 @@ export class WorkspacePersonnelService {
     if (!user) {
       throw new NotFoundException(`User with ID ${userId} not found.`);
     }
+    if (user.role === 'SUPER_ADMIN') {
+      throw new ForbiddenException('Cannot transfer Platform Founder account.');
+    }
 
     const targetWorkspace = await this.prisma.workspace.findUnique({
       where: { id: targetWorkspaceId },
@@ -1057,6 +1116,12 @@ export class WorkspacePersonnelService {
     if (!targetWorkspace) {
       throw new NotFoundException(`Target Pod with ID ${targetWorkspaceId} not found.`);
     }
+
+    this.assertOrganizationScope(
+      actorOrganizationId,
+      user.organizationId || user.workspaceMembership?.workspace?.organizationId,
+    );
+    this.assertOrganizationScope(actorOrganizationId, targetWorkspace.organizationId);
 
     const currentMembership = user.workspaceMembership;
     const sourceWorkspaceId = currentMembership?.workspaceId;
@@ -1187,13 +1252,16 @@ export class WorkspacePersonnelService {
   }
 
   /**
-   * Super Admin Authority: Promote an Agent to Leader in the same Pod (Internal Role Switch)
+   * Tenant Owner Authority: Promote an Agent to Leader in the same Pod (Internal Role Switch)
    * The current leader is automatically demoted to Frontline Agent. Total Pod capacity remains strictly FIX.
    */
-  async promoteToLeader(dto: {
-    userId: string;
-    workspaceId: string;
-  }) {
+  async promoteToLeader(
+    dto: {
+      userId: string;
+      workspaceId: string;
+    },
+    actorOrganizationId?: string,
+  ) {
     const { userId, workspaceId } = dto;
 
     const workspace = await this.prisma.workspace.findUnique({
@@ -1207,9 +1275,14 @@ export class WorkspacePersonnelService {
       throw new NotFoundException(`Pod with ID ${workspaceId} not found.`);
     }
 
+    this.assertOrganizationScope(actorOrganizationId, workspace.organizationId);
+
     const targetMember = workspace.members.find((m) => m.userId === userId);
     if (!targetMember) {
       throw new NotFoundException(`Personnel with ID ${userId} is not assigned to this pod.`);
+    }
+    if (targetMember.user?.role === 'SUPER_ADMIN') {
+      throw new ForbiddenException('Cannot alter Platform Founder privileges.');
     }
 
     if (targetMember.role === 'LEADER') {
@@ -1344,14 +1417,17 @@ export class WorkspacePersonnelService {
   }
 
   /**
-   * Super Admin Authority: 1-to-1 Cross-Pod Swap (Strict Fixed Capacity)
+   * Tenant Owner Authority: 1-to-1 Cross-Pod Swap (Strict Fixed Capacity)
    * Exchanges User A (from Pod A) with User B (from Pod B).
    * Capacities of both Pods remain strictly FIX (0 change).
    */
-  async swapPersonnel(dto: {
-    userAId: string;
-    userBId: string;
-  }) {
+  async swapPersonnel(
+    dto: {
+      userAId: string;
+      userBId: string;
+    },
+    actorOrganizationId?: string,
+  ) {
     const { userAId, userBId } = dto;
 
     if (userAId === userBId) {
@@ -1371,6 +1447,9 @@ export class WorkspacePersonnelService {
     if (!memberA || !memberB) {
       throw new NotFoundException('One or both personnel memberships were not found.');
     }
+
+    this.assertOrganizationScope(actorOrganizationId, memberA.workspace.organizationId);
+    this.assertOrganizationScope(actorOrganizationId, memberB.workspace.organizationId);
 
     if (memberA.workspaceId === memberB.workspaceId) {
       throw new BadRequestException(
@@ -1498,33 +1577,39 @@ export class WorkspacePersonnelService {
   }
 
   /**
-   * Super Admin Monetization & Expansion: Deploy a Specialized Pod ($149/mo)
+   * Tenant Owner Expansion: Deploy a Specialized Pod ($149/mo)
    */
-  async createSpecializedPod(dto: {
-    name: string;
-    podCategory?: string;
-    description?: string;
-    services?: string[];
-    quota?: number;
-    organizationId?: string;
-    requesterIdentifier?: string;
-  }) {
+  async createSpecializedPod(
+    dto: {
+      name: string;
+      podCategory?: string;
+      description?: string;
+      services?: string[];
+      quota?: number;
+      organizationId?: string;
+      requesterIdentifier?: string;
+    },
+    actorUserId?: string,
+    actorOrganizationId?: string,
+  ) {
     const cleanName = (dto.name || '').trim();
     if (!cleanName) {
       throw new BadRequestException('Pod name is required.');
     }
 
-    // 1. Resolve Organization: prioritize specified organizationId, fallback to requester's org or database
-    let org = null;
-    if (dto.organizationId) {
-      org = await this.prisma.organization.findUnique({
-        where: { id: dto.organizationId },
-      });
-    }
+    // Resolve Organization strictly from authenticated actorOrganizationId when present
+    const targetOrgId = actorOrganizationId || dto.organizationId;
+    let org = targetOrgId
+      ? await this.prisma.organization.findUnique({
+          where: { id: targetOrgId },
+        })
+      : null;
 
-    // 2. Resolve Super Admin Owner: prioritize requesterIdentifier, then admin in org, then fallback
-    let owner = null;
-    if (dto.requesterIdentifier) {
+    let owner = actorUserId
+      ? await this.prisma.user.findUnique({ where: { id: actorUserId } })
+      : null;
+
+    if (!owner && dto.requesterIdentifier && !actorOrganizationId) {
       owner = await this.prisma.user.findFirst({
         where: {
           OR: [
@@ -1540,7 +1625,7 @@ export class WorkspacePersonnelService {
       owner = await this.prisma.user.findFirst({
         where: {
           organizationId: org.id,
-          role: 'SUPER_ADMIN',
+          role: 'TENANT_OWNER',
         },
       });
       if (!owner) {
@@ -1551,31 +1636,17 @@ export class WorkspacePersonnelService {
     }
 
     if (!owner) {
-      owner = await this.prisma.user.findFirst({
-        where: {
-          OR: [
-            { username: 'pungkyrama' },
-            { role: 'SUPER_ADMIN' },
-          ],
-        },
-        orderBy: { createdAt: 'asc' },
-      });
+      throw new BadRequestException('No tenant owner found to anchor new specialized pod.');
     }
 
-    if (!owner) {
-      throw new BadRequestException('No admin owner found to anchor new specialized pod.');
-    }
-
-    if (!org && owner?.organizationId) {
+    if (!org && owner.organizationId) {
       org = await this.prisma.organization.findUnique({
         where: { id: owner.organizationId },
       });
     }
 
     if (!org) {
-      org = await this.prisma.organization.findFirst({
-        orderBy: { createdAt: 'asc' },
-      });
+      throw new NotFoundException('Organization not found for this Tenant Owner.');
     }
 
     const leaderTokenStr =
@@ -1642,12 +1713,15 @@ export class WorkspacePersonnelService {
   }
 
   /**
-   * Super Admin Monetization & Expansion: Add Frontline Seats to a Pod (+$30/seat/mo)
+   * Tenant Owner Expansion: Add Frontline Seats to a Pod (+$30/seat/mo)
    */
-  async addSeatToPod(dto: {
-    workspaceId: string;
-    seatCount: number;
-  }) {
+  async addSeatToPod(
+    dto: {
+      workspaceId: string;
+      seatCount: number;
+    },
+    actorOrganizationId?: string,
+  ) {
     if (!dto.workspaceId) {
       throw new BadRequestException('workspaceId is required.');
     }
@@ -1664,6 +1738,8 @@ export class WorkspacePersonnelService {
     if (!workspace) {
       throw new BadRequestException('Workspace pod not found.');
     }
+
+    this.assertOrganizationScope(actorOrganizationId, workspace.organizationId);
 
     const currentQuota = workspace.assignedQuota || 0;
     if (currentQuota + count > 8) {
@@ -1723,40 +1799,21 @@ export class WorkspacePersonnelService {
   }
 
   /**
-   * Super Admin Sovereign Session Revocation (Force Logout)
-   * Immediately terminates active session for a leader or agent across all pods,
-   * invalidates single-use credentials, and broadcasts termination signal.
+   * Session Revocation (Force Logout)
+   * When actorOrganizationId is provided (Tenant Owner), restricts revocation strictly to that organization.
+   * When actorOrganizationId is omitted (Platform Founder via SuperAdminModule), allows cross-tenant revocation.
    */
   async forceLogoutUser(
     userId?: string,
     username?: string,
     token?: string,
-    requesterIdentifier?: string,
+    actorOrganizationId?: string,
   ) {
-    if (requesterIdentifier && requesterIdentifier.trim() !== '') {
-      const requester = await this.prisma.user.findFirst({
-        where: {
-          OR: [
-            { id: requesterIdentifier },
-            { username: { equals: requesterIdentifier, mode: 'insensitive' } },
-            { email: { equals: requesterIdentifier, mode: 'insensitive' } },
-          ],
-        },
-      });
-      const isSuperAdmin =
-        requester?.role === 'SUPER_ADMIN' ||
-        requester?.username?.toLowerCase() === 'pungkyrama';
-      if (!isSuperAdmin) {
-        throw new ForbiddenException(
-          'Access denied. Only Super Admin has sovereign authority to force logout personnel.',
-        );
-      }
-    }
-
     let targetUser: any = null;
     if (userId && userId.trim() !== '') {
       targetUser = await this.prisma.user.findUnique({
         where: { id: userId.trim() },
+        include: { workspaceMembership: { include: { workspace: true } } },
       });
     }
 
@@ -1768,6 +1825,7 @@ export class WorkspacePersonnelService {
             { fullName: { equals: username.trim(), mode: 'insensitive' } },
           ],
         },
+        include: { workspaceMembership: { include: { workspace: true } } },
       });
     }
 
@@ -1783,6 +1841,7 @@ export class WorkspacePersonnelService {
               { fullName: { equals: tokRec.usedBy.trim(), mode: 'insensitive' } },
             ],
           },
+          include: { workspaceMembership: { include: { workspace: true } } },
         });
       }
     }
@@ -1791,9 +1850,14 @@ export class WorkspacePersonnelService {
       throw new NotFoundException('Target personnel account not found to force logout.');
     }
 
-    if (targetUser.role === 'SUPER_ADMIN' || targetUser.username?.toLowerCase() === 'pungkyrama') {
-      throw new BadRequestException('Cannot force logout Super Administrator.');
+    if (targetUser.role === 'SUPER_ADMIN') {
+      throw new BadRequestException('Cannot force logout Platform Founder.');
     }
+
+    this.assertOrganizationScope(
+      actorOrganizationId,
+      targetUser.organizationId || targetUser.workspaceMembership?.workspace?.organizationId,
+    );
 
     // Terminate all active sessions for this user
     await this.prisma.userActivitySession.updateMany({
