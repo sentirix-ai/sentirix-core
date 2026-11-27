@@ -5,14 +5,19 @@ import {
   UnauthorizedException,
   Logger,
 } from '@nestjs/common';
-import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { EventsGateway } from '../events/events.gateway.js';
 import { RegisterDto } from './dto/register.dto.js';
 import { LoginDto } from './dto/login.dto.js';
 import { UpdateAvatarDto } from './dto/update-avatar.dto.js';
+import {
+  hashPasswordScrypt,
+  verifyPasswordHash,
+  signJwt,
+} from '../../common/security/crypto.util.js';
 
 export interface AuthUserResponse {
   id: string;
@@ -53,51 +58,71 @@ export class AuthService implements OnModuleInit {
   private readonly logger = new Logger(AuthService.name);
 
   // In-memory fallback for local development resilience
-  private memoryUsers: StoredMemoryUser[] = [
-    {
-      id: 'usr-admin-01',
-      username: 'pungkyrama',
-      email: 'admin@sentrix.enterprise',
-      phone: '+1-555-019-0000',
-      passwordHash: this.hashPassword('0o0o 0o0o'),
-      role: 'ADMIN',
-      verificationMethod: 'EMAIL',
-      isVerified: true,
-      onboardingCompleted: true,
-      createdAt: new Date().toISOString(),
-    },
-  ];
+  private memoryUsers: StoredMemoryUser[] = [];
+
+  private getAdminUsername(): string {
+    return (process.env.ADMIN_USERNAME || 'pungkyrama').trim();
+  }
+
+  private getAdminEmail(): string {
+    return (process.env.ADMIN_EMAIL || 'admin@sevaniq.enterprise').trim();
+  }
+
+  private getAdminPassword(): string | null {
+    const envPass = process.env.ADMIN_PASSWORD?.trim();
+    return envPass || null;
+  }
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly eventsGateway: EventsGateway,
-  ) {}
+  ) {
+    const adminPassword = this.getAdminPassword();
+    this.memoryUsers = adminPassword
+      ? [
+          {
+            id: 'usr-admin-01',
+            username: this.getAdminUsername(),
+            email: this.getAdminEmail(),
+            phone: '+1-555-019-0000',
+            passwordHash: this.hashPassword(adminPassword),
+            role: 'ADMIN',
+            verificationMethod: 'EMAIL',
+            isVerified: true,
+            onboardingCompleted: true,
+            createdAt: new Date().toISOString(),
+          },
+        ]
+      : [];
+  }
 
   async onModuleInit() {
     try {
+      const adminUsername = this.getAdminUsername();
+      const adminEmail = this.getAdminEmail();
+      const adminPassword = this.getAdminPassword();
       const adminExists = await this.prisma.user.findFirst({
         where: {
           OR: [
-            { username: 'pungkyrama' },
-            { email: 'admin@sentrix.enterprise' },
-            { email: 'admin@sentirix.enterprise' },
-            { email: 'admin@omniflow.enterprise' },
+            { username: adminUsername },
+            { email: adminEmail },
+            { email: 'admin@sevaniq.enterprise' },
           ],
         },
       });
 
-      if (!adminExists) {
+      if (!adminExists && adminPassword) {
         await this.prisma.user.create({
           data: {
-            username: 'pungkyrama',
+            username: adminUsername,
             fullName: 'Pungky Rama (Admin)',
-            email: 'admin@sentrix.enterprise',
+            email: adminEmail,
             phone: '+1-555-019-0000',
-            passwordHash: this.hashPassword('0o0o 0o0o'),
+            passwordHash: this.hashPassword(adminPassword),
             role: 'SUPER_ADMIN',
           },
         });
-        this.logger.log('Default Super Admin user (@pungkyrama) seeded into database.');
+        this.logger.log(`Default Super Admin user (@${adminUsername}) seeded into database.`);
       }
     } catch (err) {
       this.logger.warn(`Could not seed default admin into db: ${(err as Error)?.message}`);
@@ -347,15 +372,24 @@ export class AuthService implements OnModuleInit {
     }
   }
 
-  // Cryptographic SHA-256 hash
+  // Salted scrypt password hash
   hashPassword(password: string): string {
-    return crypto.createHash('sha256').update(password).digest('hex');
+    return hashPasswordScrypt(password);
   }
 
-  // Generate simulated secure JWT token
-  private generateToken(userId: string, role: string): string {
-    const payload = `${userId}:${role}:${Date.now()}`;
-    return Buffer.from(payload).toString('base64');
+  // Generate cryptographically signed HS256 JWT token
+  private generateToken(
+    userId: string,
+    role: string,
+    username?: string,
+    workspaceId?: string,
+  ): string {
+    return signJwt({
+      sub: userId,
+      role,
+      username,
+      workspaceId,
+    });
   }
 
   // Retrieve persistent onboarding draft for any associated identifier
@@ -426,7 +460,7 @@ export class AuthService implements OnModuleInit {
     }
 
     // Prevent overriding admin
-    if (lowerUsername === 'pungkyrama') {
+    if (lowerUsername === this.getAdminUsername().toLowerCase()) {
       throw new BadRequestException('This username is reserved for system administration.');
     }
 
@@ -464,7 +498,7 @@ export class AuthService implements OnModuleInit {
         },
       });
 
-      this.logger.log(`User @${lowerUsername} registered successfully in PostgreSQL db_sentirix.`);
+      this.logger.log(`User @${lowerUsername} registered successfully in PostgreSQL db_sevaniq.`);
       // Ensure clean slate by wiping any stale draft files for this username/email
       this.deleteOnboardingDraftForUser([lowerUsername, lowerEmail]);
 
@@ -477,7 +511,7 @@ export class AuthService implements OnModuleInit {
         verificationMethod: dto.verificationMethod,
         isVerified: true,
         avatarText: (dbUser.username || lowerUsername).slice(0, 2).toUpperCase(),
-        token: this.generateToken(dbUser.id, 'USER'),
+        token: this.generateToken(dbUser.id, 'USER', dbUser.username || lowerUsername),
         onboardingCompleted: false,
       };
     } catch (err) {
@@ -524,7 +558,7 @@ export class AuthService implements OnModuleInit {
         verificationMethod: newUser.verificationMethod,
         isVerified: newUser.isVerified,
         avatarText: newUser.username.slice(0, 2).toUpperCase(),
-        token: this.generateToken(newUser.id, newUser.role),
+        token: this.generateToken(newUser.id, newUser.role, newUser.username),
         onboardingCompleted: false,
       };
     }
@@ -532,41 +566,83 @@ export class AuthService implements OnModuleInit {
 
   async login(dto: LoginDto): Promise<AuthUserResponse> {
     const cleanId = dto.identifier.trim();
+    const adminUsername = this.getAdminUsername();
+    const adminEmail = this.getAdminEmail();
+    const adminPassword = this.getAdminPassword();
 
-    // 1. Direct Admin Credential Validation (pungkyrama & 0o0o 0o0o)
-    if (cleanId === 'pungkyrama' && dto.password === '0o0o 0o0o') {
-      this.logger.log('Admin Master login successful: @pungkyrama');
-      let adminAvatarUrl: string | null = null;
+    // 1. Direct Admin Credential Validation (verified via DB scrypt hash or constant-time env hash)
+    const isAdminIdentifier =
+      cleanId.toLowerCase() === adminUsername.toLowerCase() ||
+      cleanId.toLowerCase() === adminEmail.toLowerCase();
+
+    if (isAdminIdentifier) {
+      let dbAdmin: {
+        id: string;
+        username: string | null;
+        email: string;
+        passwordHash: string;
+        avatarUrl: string | null;
+      } | null = null;
       try {
-        const dbAdmin = await this.prisma.user.findFirst({
-          where: { username: 'pungkyrama' },
-          select: { avatarUrl: true },
+        dbAdmin = await this.prisma.user.findFirst({
+          where: {
+            OR: [
+              { username: { equals: adminUsername, mode: 'insensitive' } },
+              { email: { equals: adminEmail, mode: 'insensitive' } },
+            ],
+          },
+          select: {
+            id: true,
+            username: true,
+            email: true,
+            passwordHash: true,
+            avatarUrl: true,
+          },
         });
-        if (dbAdmin?.avatarUrl) adminAvatarUrl = dbAdmin.avatarUrl;
       } catch {}
 
-      return {
-        id: 'usr-admin-01',
-        username: 'pungkyrama',
-        email: 'admin@sentrix.enterprise',
-        phone: '+1-555-019-0000',
-        role: 'ADMIN',
-        isVerified: true,
-        avatarText: 'PR',
-        avatarUrl: adminAvatarUrl || (this.memoryUsers[0] as any)?.avatarUrl || undefined,
-        token: this.generateToken('usr-admin-01', 'ADMIN'),
-        onboardingCompleted: true,
-      };
+      let adminAuthorized = false;
+      if (dbAdmin && dbAdmin.passwordHash) {
+        const check = verifyPasswordHash(dto.password, dbAdmin.passwordHash);
+        adminAuthorized = check.valid;
+      } else if (adminPassword) {
+        const a = crypto.createHash('sha256').update(dto.password).digest();
+        const b = crypto.createHash('sha256').update(adminPassword).digest();
+        adminAuthorized = crypto.timingSafeEqual(a, b);
+      }
+
+      if (adminAuthorized) {
+        const effectiveId = dbAdmin?.id || 'usr-admin-01';
+        const effectiveUsername = dbAdmin?.username || adminUsername;
+        const effectiveEmail = dbAdmin?.email || adminEmail;
+        this.logger.log(`Admin Master login successful: @${effectiveUsername}`);
+
+        return {
+          id: effectiveId,
+          username: effectiveUsername,
+          email: effectiveEmail,
+          phone: '+1-555-019-0000',
+          role: 'ADMIN',
+          isVerified: true,
+          avatarText: 'PR',
+          avatarUrl: dbAdmin?.avatarUrl || this.memoryUsers[0]?.avatarUrl || undefined,
+          token: this.generateToken(effectiveId, 'SUPER_ADMIN', effectiveUsername),
+          onboardingCompleted: true,
+        };
+      }
+
+      throw new UnauthorizedException(
+        'Invalid Admin credentials. Please verify your administrator username and password.',
+      );
     }
 
-    if (dto.role === 'ADMIN' || (dto.role as any) === 'SUPER_ADMIN') {
+    if (dto.role === 'ADMIN' || (dto.role as string) === 'SUPER_ADMIN') {
       throw new UnauthorizedException(
-        'Invalid Admin credentials. Hint: username "pungkyrama" and password "0o0o 0o0o"',
+        'Invalid Admin credentials. Please verify your administrator username and password.',
       );
     }
 
     // 2. User Login: Unified search by username OR email
-    const enteredHash = this.hashPassword(dto.password);
     const lowerId = cleanId.toLowerCase();
 
     // Try finding in database first
@@ -587,12 +663,29 @@ export class AuthService implements OnModuleInit {
       });
 
       if (dbUser) {
-        if (dbUser.passwordHash !== enteredHash) {
+        const pwCheck = verifyPasswordHash(dto.password, dbUser.passwordHash);
+        if (!pwCheck.valid) {
           throw new UnauthorizedException('Incorrect password. Please verify and try again.');
+        }
+
+        // Transparently upgrade legacy unsalted SHA-256 hashes to salted scrypt
+        if (pwCheck.needsRehash) {
+          this.prisma.user
+            .update({
+              where: { id: dbUser.id },
+              data: { passwordHash: this.hashPassword(dto.password) },
+            })
+            .catch(() => {});
         }
 
         const wsRole = dbUser.workspaceMembership?.role;
         const isLeader = wsRole === 'LEADER';
+        const effectiveRole =
+          dbUser.role === 'SUPER_ADMIN'
+            ? 'SUPER_ADMIN'
+            : dbUser.role === 'POD_LEADER' || isLeader
+              ? 'POD_LEADER'
+              : dbUser.role;
 
         const draft = this.getOnboardingDraftForUser([
           dbUser.username,
@@ -607,7 +700,7 @@ export class AuthService implements OnModuleInit {
           fullName: (dbUser.fullName || dbUser.username) ?? undefined,
           email: dbUser.email,
           phone: dbUser.phone || undefined,
-          role: dbUser.role === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : dbUser.role === 'POD_LEADER' || isLeader ? 'POD_LEADER' : dbUser.role,
+          role: effectiveRole,
           workspaceRole: wsRole || undefined,
           workspaceId: dbUser.workspaceMembership?.workspaceId || undefined,
           workspaceName: dbUser.workspaceMembership?.workspace?.name || undefined,
@@ -616,7 +709,12 @@ export class AuthService implements OnModuleInit {
           isVerified: true,
           avatarText: (dbUser.username || dbUser.fullName).slice(0, 2).toUpperCase(),
           avatarUrl: dbUser.avatarUrl || undefined,
-          token: this.generateToken(dbUser.id, dbUser.role),
+          token: this.generateToken(
+            dbUser.id,
+            effectiveRole,
+            dbUser.username || dbUser.fullName,
+            dbUser.workspaceMembership?.workspaceId || undefined,
+          ),
           onboardingCompleted: dbUser.onboardingCompleted ?? false,
           onboardingDraft: draft || null,
         };
@@ -637,7 +735,8 @@ export class AuthService implements OnModuleInit {
       );
     }
 
-    if (memoryUser.passwordHash !== enteredHash) {
+    const memCheck = verifyPasswordHash(dto.password, memoryUser.passwordHash);
+    if (!memCheck.valid) {
       throw new UnauthorizedException('Incorrect password. Please verify and try again.');
     }
 
@@ -658,7 +757,7 @@ export class AuthService implements OnModuleInit {
       isVerified: memoryUser.isVerified,
       avatarText: memoryUser.username.slice(0, 2).toUpperCase(),
       avatarUrl: memoryUser.avatarUrl || undefined,
-      token: this.generateToken(memoryUser.id, memoryUser.role),
+      token: this.generateToken(memoryUser.id, memoryUser.role, memoryUser.username),
       onboardingCompleted: memoryUser.onboardingCompleted ?? false,
       onboardingDraft: memoryDraft || null,
     };

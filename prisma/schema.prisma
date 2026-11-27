@@ -27,7 +27,7 @@ model PlatformFounderProfile {
   @@map("platform_founder_profiles")
 }
 
-/// Rekaman historis pertumbuhan dan performa sistem Sentirix dari waktu ke waktu
+/// Rekaman historis pertumbuhan dan performa sistem Sevaniq dari waktu ke waktu
 model PlatformSnapshot {
   id                String   @id @default(uuid())
   recordedAt        DateTime @default(now())

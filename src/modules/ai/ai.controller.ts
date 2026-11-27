@@ -1,15 +1,17 @@
 import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
-import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { AiService } from './ai.service.js';
 import { AnalyzeTicketDto, AnalyzeTicketResponseDto } from './dto/analyze-ticket.dto.js';
 import { DraftReplyDto, DraftReplyResponseDto } from './dto/draft-reply.dto.js';
 import { SummarizeThreadDto, SummarizeThreadResponseDto } from './dto/summarize-thread.dto.js';
+import { Public } from '../../common/auth/auth.decorators.js';
 
 @ApiTags('AI')
 @Controller('ai')
 export class AiController {
   constructor(private readonly aiService: AiService) {}
 
+  @Public()
   @Post('analyze-ticket')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Analyze ticket sentiment, urgency priority, and auto-tags via Gemini AI' })
@@ -21,6 +23,7 @@ export class AiController {
     });
   }
 
+  @ApiBearerAuth()
   @Post('draft-reply')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Generate one-click AI reply draft grounded on conversation history & knowledge base' })

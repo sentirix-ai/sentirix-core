@@ -1,8 +1,8 @@
 {
-  "name": "sentirix-core",
+  "name": "sevaniq-core",
   "version": "1.0.0",
   "description": "The AI-Native Customer Support Platform - Core Backend API & Real-time WebSocket Gateway",
-  "author": "Sentirix Team",
+  "author": "Sevaniq Team",
   "private": true,
   "license": "MIT",
   "type": "module",

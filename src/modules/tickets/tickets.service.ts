@@ -1,4 +1,5 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { AiService } from '../ai/ai.service.js';
 import { EventsGateway } from '../events/events.gateway.js';
@@ -125,17 +126,35 @@ export class TicketsService {
     const attachmentData = dto.attachmentData || dto.attachments?.[0]?.data || null;
 
     try {
-      // Find a valid customer ID in database
-      let finalCustomerId = 'usr-admin-01';
+      // Find a valid customer ID in database (never link public tickets to SUPER_ADMIN)
+      let finalCustomerId = '';
       if (dto.customerId) {
         const existingUser = await this.prisma.user.findUnique({ where: { id: dto.customerId } });
-        if (existingUser) finalCustomerId = existingUser.id;
+        if (existingUser && existingUser.role !== 'SUPER_ADMIN') {
+          finalCustomerId = existingUser.id;
+        }
       }
-      if (finalCustomerId === 'usr-admin-01') {
-        const defaultUser = await this.prisma.user.findFirst({
-          where: { OR: [{ role: 'SUPER_ADMIN' }, { username: 'pungkyrama' }] },
+      if (!finalCustomerId) {
+        const defaultCustomer = await this.prisma.user.findFirst({
+          where: { role: 'CUSTOMER' },
+          orderBy: { createdAt: 'asc' },
         });
-        if (defaultUser) finalCustomerId = defaultUser.id;
+        if (defaultCustomer) {
+          finalCustomerId = defaultCustomer.id;
+        } else {
+          const portalGuest = await this.prisma.user.upsert({
+            where: { email: 'guest@portal.sevaniq.local' },
+            update: {},
+            create: {
+              username: 'portal_guest',
+              email: 'guest@portal.sevaniq.local',
+              passwordHash: `disabled:${crypto.randomBytes(32).toString('hex')}`,
+              fullName: 'Portal Guest Customer',
+              role: 'CUSTOMER',
+            },
+          });
+          finalCustomerId = portalGuest.id;
+        }
       }
 
       // Attempt PostgreSQL insertion via Prisma

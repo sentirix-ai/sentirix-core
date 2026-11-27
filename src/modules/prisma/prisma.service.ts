@@ -11,7 +11,7 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
       this.logger.log('PostgreSQL database connection established via Prisma.');
     } catch (error) {
       this.logger.warn(
-        'PostgreSQL connection not ready yet. Please ensure DATABASE_URL in .env points to an active database.',
+        `PostgreSQL connection not ready yet (${(error as Error)?.message ?? 'unknown error'}). Please ensure DATABASE_URL in .env points to an active database.`,
       );
     }
   }

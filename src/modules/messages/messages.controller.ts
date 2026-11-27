@@ -1,9 +1,10 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post } from '@nestjs/common';
-import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { MessagesService, MessageRecord } from './messages.service.js';
 import { CreateMessageDto } from './dto/message.dto.js';
 
 @ApiTags('Messages')
+@ApiBearerAuth()
 @Controller('messages')
 export class MessagesController {
   constructor(private readonly messagesService: MessagesService) {}

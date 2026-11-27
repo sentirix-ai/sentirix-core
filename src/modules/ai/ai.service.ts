@@ -105,7 +105,7 @@ Check for error codes, server crash dialogs, payment failed indicators, transact
 Incorporate visual insights to calibrate urgency priority and customer sentiment accurately.`
         : '';
 
-      const prompt = `You are the Chief AI Triage Officer for Sentirix enterprise service operations.
+      const prompt = `You are the Chief AI Triage Officer for Sevaniq enterprise service operations.
 Company Business Sector / Industry: "${context?.industry || 'General Business'}"
 Analyze this inbound customer support ticket and classify it accurately.
 ${podsDescription}
@@ -199,7 +199,7 @@ Return strictly JSON format:
 
     if (this.aiClient) {
       try {
-        const prompt = `You are a world-class enterprise operations architect for Sentirix.
+        const prompt = `You are a world-class enterprise operations architect for Sevaniq.
 The user is setting up a customer support organization.
 Industry/Sector: "${cleanIndustry}"
 ${cleanDesc ? `Additional Specifics / Business Model: "${cleanDesc}"` : ''}
@@ -300,8 +300,8 @@ Return strictly JSON format:
 
     if (this.aiClient) {
       try {
-        const prompt = `You are the Chief AI Service Governance Architect for Sentirix B2B enterprise customer operations.
-A company in the "${industry}" sector is attempting to rename one of Sentirix's 6 core baseline complaint categories.
+        const prompt = `You are the Chief AI Service Governance Architect for Sevaniq B2B enterprise customer operations.
+A company in the "${industry}" sector is attempting to rename one of Sevaniq's 6 core baseline complaint categories.
 
 Baseline Service Name: "${original}"
 Proposed New Service Name: "${candidate}"
@@ -349,7 +349,7 @@ Return strictly JSON format:
   private fallbackSemanticValidation(
     original: string,
     candidate: string,
-    industry: string,
+    _industry: string,
   ): {
     isCompatible: boolean;
     confidenceScore: number;
@@ -450,7 +450,7 @@ Extract any visible text, error messages, HTTP status codes, transaction IDs, in
 Ground your draft response directly on the visual evidence provided in these attachments.`
         : '';
 
-      const prompt = `You are Sentrix AI Copilot assisting a human support agent.
+      const prompt = `You are Sevaniq AI Copilot assisting a human support agent.
 Ticket Title: ${dto.ticketTitle}
 Initial Complaint: ${dto.ticketDescription}
 
@@ -1285,9 +1285,6 @@ Return as a JSON array of 3 strings: ["point 1", "point 2", "point 3"]`;
 
     // 13. CUSTOM / GENERAL (OTHER)
     const cleanCustom = (customDescription || '').trim();
-    const customLabel = cleanCustom
-      ? ` (${cleanCustom.slice(0, 20).trim()})`
-      : '';
     const otherPods = [
       {
         name: cleanCustom ? `${cleanCustom.slice(0, 32).trim()} Operations Pod` : 'Frontline Customer Operations Pod',

@@ -9,7 +9,7 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { TicketsService, TicketRecord } from './tickets.service.js';
 import {
   CreateTicketDto,
@@ -17,12 +17,14 @@ import {
   AssignTicketDto,
   TransferTicketPodDto,
 } from './dto/ticket.dto.js';
+import { Public, Roles } from '../../common/auth/auth.decorators.js';
 
 @ApiTags('Tickets')
 @Controller('tickets')
 export class TicketsController {
   constructor(private readonly ticketsService: TicketsService) {}
 
+  @Public()
   @Post()
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({
@@ -33,6 +35,7 @@ export class TicketsController {
     return this.ticketsService.create(dto);
   }
 
+  @ApiBearerAuth()
   @Get()
   @ApiOperation({ summary: 'List and filter tickets by status, priority, search keyword, or workspace/pod' })
   @ApiQuery({ name: 'status', required: false, enum: ['NEW', 'OPEN', 'PENDING', 'RESOLVED', 'CLOSED'] })
@@ -80,6 +83,8 @@ export class TicketsController {
     return this.ticketsService.transferPod(id, dto.targetPodId, dto.handoverNote, dto.actorId);
   }
 
+  @ApiBearerAuth()
+  @Roles('ADMIN', 'SUPER_ADMIN')
   @Post('demo/cleanup')
   @ApiOperation({ summary: 'Clean up all demo showcase tickets' })
   async cleanupDemo(): Promise<{ count: number }> {

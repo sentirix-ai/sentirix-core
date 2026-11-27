@@ -7,10 +7,15 @@ import {
   Param,
   Query,
   BadRequestException,
+  Req,
 } from '@nestjs/common';
+import { ApiBearerAuth } from '@nestjs/swagger';
 import { WorkspaceService } from './workspace.service.js';
 import { JoinWorkspaceDto } from './dto/join-workspace.dto.js';
+import { Public, Roles } from '../../common/auth/auth.decorators.js';
+import type { AuthenticatedRequest } from '../../common/auth/jwt-auth.guard.js';
 
+@ApiBearerAuth()
 @Controller('workspace')
 export class WorkspaceController {
   constructor(private readonly workspaceService: WorkspaceService) {}
@@ -30,6 +35,7 @@ export class WorkspaceController {
   /**
    * Validate an invite link before showing the join form
    */
+  @Public()
   @Get('validate-invite/:token')
   async validateInvite(
     @Param('token') token: string,
@@ -41,6 +47,7 @@ export class WorkspaceController {
   /**
    * One-Click Join Workspace (Full Name only)
    */
+  @Public()
   @Post('join')
   async joinWorkspace(@Body() dto: JoinWorkspaceDto) {
     return this.workspaceService.joinWorkspace(dto);
@@ -99,6 +106,7 @@ export class WorkspaceController {
   /**
    * Check if a guest member account is still active in the database
    */
+  @Public()
   @Get('member-status')
   async checkMemberStatus(@Query('userId') userId: string) {
     return this.workspaceService.checkMemberStatus(userId);
@@ -208,6 +216,7 @@ export class WorkspaceController {
   /**
    * Get dynamic interconnected quota status for a Leader token
    */
+  @Public()
   @Get('leader-token-status/:token')
   async getLeaderTokenStatus(
     @Param('token') token: string,
@@ -222,6 +231,7 @@ export class WorkspaceController {
   /**
    * Interactive Quota Lock Toggle from Step 2 of Leader Activation
    */
+  @Public()
   @Post('toggle-pod-quota-lock')
   async togglePodQuotaLock(
     @Body()
@@ -238,6 +248,7 @@ export class WorkspaceController {
   /**
    * Lock Leader Quota (Click Checkmark [✓]) & Auto-Generate Single-Use Agent Tokens
    */
+  @Public()
   @Post('lock-leader-quota')
   async lockLeaderQuota(
     @Body()
@@ -255,6 +266,7 @@ export class WorkspaceController {
   /**
    * Validate Agent Single-Use Token
    */
+  @Public()
   @Get('agent-token-status/:token')
   async getAgentTokenStatus(
     @Param('token') token: string,
@@ -269,6 +281,7 @@ export class WorkspaceController {
   /**
    * Claim Agent Single-Use Token and Join Pod
    */
+  @Public()
   @Post('claim-agent-token')
   async claimAgentToken(
     @Body()
@@ -285,12 +298,17 @@ export class WorkspaceController {
   /**
    * Get Super Admin Executive Cockpit Data
    */
+  @Roles('ADMIN', 'SUPER_ADMIN')
   @Get('super-admin-cockpit')
-  async getSuperAdminCockpit(@Query('identifier') identifier: string) {
-    if (!identifier) {
+  async getSuperAdminCockpit(
+    @Req() req: AuthenticatedRequest,
+    @Query('identifier') identifier?: string,
+  ) {
+    const effectiveIdentifier = req.user?.username || identifier;
+    if (!effectiveIdentifier) {
       throw new BadRequestException('Administrator identifier is required.');
     }
-    return this.workspaceService.getSuperAdminCockpitData(identifier);
+    return this.workspaceService.getSuperAdminCockpitData(effectiveIdentifier);
   }
 
   /**
@@ -355,20 +373,22 @@ export class WorkspaceController {
    */
   @Post('regenerate-token')
   async regenerateToken(
+    @Req() req: AuthenticatedRequest,
     @Body() body: { token?: string; identifier?: string; workspaceId?: string },
   ) {
+    const verifiedIdentifier = req.user?.username || body.identifier;
     if (
       (body?.token && body.token.trim() !== '') ||
       (body?.workspaceId && body.workspaceId.trim() !== '')
     ) {
       return this.workspaceService.regenerateToken(
         body.token,
-        body.identifier,
+        verifiedIdentifier,
         body.workspaceId,
       );
     }
-    if (body?.identifier && body.identifier.trim() !== '') {
-      const ws = await this.workspaceService.getOrCreateUserWorkspace(body.identifier);
+    if (verifiedIdentifier && verifiedIdentifier.trim() !== '') {
+      const ws = await this.workspaceService.getOrCreateUserWorkspace(verifiedIdentifier);
       return {
         success: true,
         newToken: ws.inviteToken,
@@ -382,6 +402,7 @@ export class WorkspaceController {
   /**
    * Super Admin Sovereign Session Revocation (Force Logout)
    */
+  @Roles('ADMIN', 'SUPER_ADMIN')
   @Post('force-logout')
   async forceLogout(
     @Body()
@@ -403,6 +424,7 @@ export class WorkspaceController {
   /**
    * Super Admin Authority: Rename Leader or Member Personnel
    */
+  @Roles('ADMIN', 'SUPER_ADMIN')
   @Post('rename-personnel')
   async renamePersonnel(
     @Body() body: { userId: string; newFullName: string },
@@ -416,6 +438,7 @@ export class WorkspaceController {
   /**
    * Super Admin Authority: Transfer / Reassign Personnel Across Pods (Mutasi Kerja)
    */
+  @Roles('ADMIN', 'SUPER_ADMIN')
   @Post('transfer-personnel')
   async transferPersonnel(
     @Body()
@@ -436,6 +459,7 @@ export class WorkspaceController {
   /**
    * Super Admin Authority: Promote an Agent to Leader in the same Pod (Role Switch)
    */
+  @Roles('ADMIN', 'SUPER_ADMIN')
   @Post('promote-leader')
   async promoteLeader(
     @Body() body: { userId: string; workspaceId: string },
@@ -449,6 +473,7 @@ export class WorkspaceController {
   /**
    * Super Admin Authority: 1-to-1 Cross-Pod Swap (Strict Fixed Capacity)
    */
+  @Roles('ADMIN', 'SUPER_ADMIN')
   @Post('swap-personnel')
   async swapPersonnel(
     @Body() body: { userAId: string; userBId: string },
@@ -462,6 +487,7 @@ export class WorkspaceController {
   /**
    * Super Admin Monetization & Expansion: Deploy a Specialized Pod ($149/mo)
    */
+  @Roles('ADMIN', 'SUPER_ADMIN')
   @Post('create-pod')
   async createPod(
     @Body()
@@ -484,6 +510,7 @@ export class WorkspaceController {
   /**
    * Super Admin Monetization & Expansion: Add Frontline Seats to a Pod (+$30/seat/mo)
    */
+  @Roles('ADMIN', 'SUPER_ADMIN')
   @Post('add-seat')
   async addSeat(
     @Body()

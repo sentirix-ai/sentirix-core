@@ -56,9 +56,11 @@ export class AnalyticsService {
    */
   assertAdmin(identifier?: string) {
     const clean = identifier?.toLowerCase().trim();
-    if (clean !== 'pungkyrama' && clean !== 'admin@sentrix.enterprise') {
+    const adminUsername = (process.env.ADMIN_USERNAME || 'pungkyrama').toLowerCase().trim();
+    const adminEmail = (process.env.ADMIN_EMAIL || 'admin@sevaniq.enterprise').toLowerCase().trim();
+    if (clean !== adminUsername && clean !== adminEmail) {
       throw new ForbiddenException(
-        'Access denied. Owner Analytics & Marketing Dashboard is restricted exclusively to Platform Founder (@pungkyrama).',
+        'Access denied. Owner Analytics & Marketing Dashboard is restricted exclusively to Platform Founder.',
       );
     }
   }
@@ -67,9 +69,11 @@ export class AnalyticsService {
     this.assertAdmin(identifier);
 
     // 1. Fetch Users excluding master admin
+    const adminUsername = (process.env.ADMIN_USERNAME || 'pungkyrama').trim();
     const nonAdminUsers = await this.prisma.user.findMany({
       where: {
-        NOT: { username: 'pungkyrama' },
+        NOT: { username: adminUsername },
+        role: { not: 'SUPER_ADMIN' },
       },
       include: {
         ownedWorkspaces: {

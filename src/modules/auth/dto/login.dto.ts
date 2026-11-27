@@ -3,7 +3,7 @@ import { IsEnum, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class LoginDto {
   @ApiProperty({
-    example: 'pungkyrama',
+    example: 'sarah.ops',
     description: 'Unified login field: enter either username or work email address',
   })
   @IsString()
@@ -11,8 +11,8 @@ export class LoginDto {
   identifier: string;
 
   @ApiProperty({
-    example: '0o0o 0o0o',
-    description: 'Password (for Admin: 0o0o 0o0o; for User: user chosen password)',
+    example: '••••••••••••',
+    description: 'Account password',
   })
   @IsString()
   @IsNotEmpty({ message: 'Password is required.' })

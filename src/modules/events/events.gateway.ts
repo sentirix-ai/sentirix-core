@@ -10,10 +10,12 @@ import {
 } from '@nestjs/websockets';
 import { Logger } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
+import { parseCorsOrigins } from '../../common/security/crypto.util.js';
 
 @WebSocketGateway({
   cors: {
-    origin: '*',
+    origin: parseCorsOrigins(),
+    credentials: true,
   },
 })
 export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
@@ -36,14 +38,14 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
 
   @SubscribeMessage('ticket:join')
   handleJoinTicket(@ConnectedSocket() client: Socket, @MessageBody() ticketId: string) {
-    client.join(`ticket_${ticketId}`);
+    void client.join(`ticket_${ticketId}`);
     this.logger.log(`Client ${client.id} joined room ticket_${ticketId}`);
     return { event: 'ticket:joined', data: ticketId };
   }
 
   @SubscribeMessage('ticket:leave')
   handleLeaveTicket(@ConnectedSocket() client: Socket, @MessageBody() ticketId: string) {
-    client.leave(`ticket_${ticketId}`);
+    void client.leave(`ticket_${ticketId}`);
     this.logger.log(`Client ${client.id} left room ticket_${ticketId}`);
     return { event: 'ticket:left', data: ticketId };
   }

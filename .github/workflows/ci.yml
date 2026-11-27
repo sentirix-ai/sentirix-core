@@ -1,4 +1,4 @@
-name: Sentirix Core CI
+name: Sevaniq Core CI
 
 on:
   push:
@@ -18,12 +18,31 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
 
       - name: Install Dependencies
-        run: npm install
+        run: npm ci
 
       - name: Generate Prisma Client
         run: npx prisma generate
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/db_sevaniq_ci?schema=public"
 
-      - name: Typecheck & Build
+      - name: Static Analysis & Lint
+        run: npm run lint
+
+      - name: Unit Tests (Vitest)
+        run: npm run test
+        env:
+          NODE_ENV: test
+          JWT_SECRET: "ci-test-secret-minimum-32-characters-long"
+
+      - name: E2E RBAC & Validation Tests
+        run: npm run test:e2e
+        env:
+          NODE_ENV: test
+          JWT_SECRET: "ci-test-secret-minimum-32-characters-long"
+
+      - name: Typecheck & Production Build
         run: npm run build
