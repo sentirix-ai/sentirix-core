@@ -377,5 +377,71 @@ describe('WorkspaceService', () => {
         service.addSeatToPod({ workspaceId: 'ws-other-org', seatCount: 1 }, 'org-A'),
       ).rejects.toThrow(ForbiddenException);
     });
+
+    it('allows returning offline Pod Leader to re-login via regenerated token without false "Token is not valid" error', async () => {
+      const leaderTokenRow = {
+        id: 'tok-ldr-meta',
+        token: 'SVQ-LDR-2DDADF',
+        role: 'LEADER',
+        isUsed: false,
+        usedBy: 'Meta',
+        openedBySession: null,
+        workspaceId: 'ws-pod-1',
+        workspace: {
+          id: 'ws-pod-1',
+          name: 'Pod 01',
+          podCategory: 'GENERAL',
+          services: ['Flight Rescheduling & Disruptions'],
+          isQuotaLocked: true,
+          assignedQuota: 8,
+          organizationId: 'org-1',
+          organization: { id: 'org-1', name: 'Kuco Corp', totalSeats: 19 },
+          members: [
+            {
+              id: 'mem-ldr',
+              userId: 'usr-meta',
+              role: 'LEADER',
+              user: {
+                id: 'usr-meta',
+                username: 'meta_6187',
+                fullName: 'Meta',
+                email: 'meta_6187@team.sevaniq.local',
+              },
+            },
+          ],
+        },
+      };
+
+      prismaMock.workspaceInviteToken.findUnique.mockResolvedValue(leaderTokenRow);
+      prismaMock.userActivitySession.findFirst.mockResolvedValue({
+        id: 'sess-old',
+        userId: 'usr-meta',
+        isOnline: false,
+        logoutAt: new Date(Date.now() - 60000),
+      });
+      prismaMock.userActivitySession.updateMany.mockResolvedValue({ count: 0 });
+      prismaMock.userActivitySession.create.mockResolvedValue({ id: 'sess-new' });
+      prismaMock.workspaceInviteToken.update.mockResolvedValue({});
+      prismaMock.workspaceInviteToken.findMany.mockResolvedValue([
+        { token: 'SVQ-AGT-111111', isUsed: true, usedBy: 'Mimi' },
+      ]);
+
+      const status = await service.getLeaderTokenQuotaStatus('SVQ-LDR-2DDADF');
+      expect(status.valid).toBe(true);
+      expect(status.isExistingLeader).toBe(true);
+      expect(status.quotaStats).toBeDefined();
+      expect(status.quotaStats!.maxSubordinatesAllowed).toBe(7);
+
+      const reloginRes = await service.lockLeaderQuota({
+        token: 'SVQ-LDR-2DDADF',
+        fullName: 'Meta',
+        chosenSubordinates: 7,
+      });
+
+      expect(reloginRes.success).toBe(true);
+      expect(reloginRes.isReLogin).toBe(true);
+      expect(reloginRes.leader.fullName).toBe('Meta');
+      expect(reloginRes.leader.token).toBeTruthy();
+    });
   });
 });

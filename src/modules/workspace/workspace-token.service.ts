@@ -17,12 +17,6 @@ import { assertNotAdmin, sanitizeToken } from './workspace.shared.js';
 export class WorkspaceTokenService {
   private readonly logger = new Logger(WorkspaceTokenService.name);
 
-  // First-Open Browser Session Lock: Only 1 browser session can open and claim each single-use token
-  private tokenOpenSessionLocks = new Map<
-    string,
-    { sessionId: string; openedAt: Date }
-  >();
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly eventsGateway: EventsGateway,
@@ -313,6 +307,8 @@ export class WorkspaceTokenService {
           isUsed: true,
           usedBy: cleanName,
           usedAt: new Date(),
+          openedBySession: null,
+          openedAt: null,
         },
       });
     } else {
@@ -471,6 +467,10 @@ export class WorkspaceTokenService {
       }
 
       // Allow seamless re-login with newly regenerated token!
+      const existingSubordinates = Math.max(
+        0,
+        (currentWorkspace.assignedQuota || 8) - 1,
+      );
       return {
         valid: true,
         token: tokenRecord.token,
@@ -497,6 +497,16 @@ export class WorkspaceTokenService {
           id: organization.id,
           name: organization.name,
           totalSeats: organization.totalSeats || 20,
+        },
+        quotaStats: {
+          totalSeats: organization.totalSeats || 20,
+          totalPods: 1,
+          lockedSeats: currentWorkspace.assignedQuota || 8,
+          lockedPodsCount: 1,
+          otherUnlockedPodsCount: 0,
+          isLastPod: false,
+          maxSubordinatesAllowed: existingSubordinates,
+          allowedOptions: [existingSubordinates],
         },
       };
     }
@@ -799,22 +809,9 @@ export class WorkspaceTokenService {
     const cleanName = fullName.trim();
     const chosenCount = Number(chosenSubordinates) || 1;
 
-    // Verify First-Open Browser Session Lock
-    if (sessionId) {
-      const activeLock = this.tokenOpenSessionLocks.get(cleanToken);
-      if (activeLock) {
-        const isExpired = Date.now() - activeLock.openedAt.getTime() > 30 * 60 * 1000;
-        if (!isExpired && activeLock.sessionId !== sessionId) {
-          throw new BadRequestException(
-            'This token is currently locked to another active browser session.',
-          );
-        }
-      }
-    }
-
-    // 1. Verify token & quota limits
+    // 1. Verify token status (supports both initial activation and returning existing leader re-login)
     const quotaStatus = await this.getLeaderTokenQuotaStatus(cleanToken, sessionId);
-    if (!quotaStatus.valid || !quotaStatus.quotaStats) {
+    if (!quotaStatus.valid || (!quotaStatus.isExistingLeader && !quotaStatus.quotaStats)) {
       throw new BadRequestException(
         (quotaStatus as any).error || 'Token is not valid.',
       );
@@ -843,10 +840,13 @@ export class WorkspaceTokenService {
     const existingLeaderMember = workspace.members.find(
       (m: any) => m.role === 'LEADER',
     );
+    const isReLogin = Boolean(existingLeaderMember && existingLeaderMember.user);
 
     let leaderUser: any;
     let totalPodQuota = workspace.assignedQuota || 2;
-    const maxAllowed = quotaStatus.quotaStats.maxSubordinatesAllowed;
+    const maxAllowed =
+      quotaStatus.quotaStats?.maxSubordinatesAllowed ??
+      Math.max(1, (workspace.assignedQuota || 8) - 1);
     const safeCount =
       workspace.isQuotaLocked && workspace.assignedQuota
         ? Math.max(1, workspace.assignedQuota - 1)
@@ -917,8 +917,8 @@ export class WorkspaceTokenService {
       });
     }
 
-    // Auto-lock neighboring pod if exactly 1 unlocked pod remains
-    if (workspace.organizationId) {
+    // Auto-lock neighboring pod only during initial pod setup if exactly 1 unlocked pod remains
+    if (!isReLogin && workspace.organizationId) {
       try {
         const remainingUnlocked = await this.prisma.workspace.findMany({
           where: {
@@ -942,7 +942,7 @@ export class WorkspaceTokenService {
           );
           const orgTotal =
             quotaStatus.organization?.totalSeats ||
-            quotaStatus.quotaStats.totalSeats ||
+            quotaStatus.quotaStats?.totalSeats ||
             20;
           const remainder = Math.min(8, Math.max(2, orgTotal - currentLockedSum));
 
@@ -994,11 +994,10 @@ export class WorkspaceTokenService {
         isUsed: true,
         usedBy: cleanName,
         usedAt: new Date(),
+        openedBySession: null,
+        openedAt: null,
       },
     });
-
-    // Release session lock once permanently claimed
-    this.tokenOpenSessionLocks.delete(cleanToken);
 
     // 6. Auto-generate exactly safeCount Single-Use Agent Tokens (reuse if already provisioned upon deploy)
     const existingAgentTokens = await this.prisma.workspaceInviteToken.findMany({
@@ -1072,12 +1071,14 @@ export class WorkspaceTokenService {
 
     return {
       success: true,
+      isReLogin,
       leader: {
         id: leaderUser.id,
         username: leaderUser.username,
         fullName: leaderUser.fullName,
         email: leaderUser.email,
         role: 'LEADER',
+        workspaceId: workspace.id,
         token: leaderSessionToken,
       },
       workspace: {
@@ -1144,7 +1145,10 @@ export class WorkspaceTokenService {
       const agentName = tokenRecord.usedBy;
       const agentUser = await this.prisma.user.findFirst({
         where: {
-          fullName: { equals: agentName, mode: 'insensitive' },
+          OR: [
+            { fullName: { equals: agentName, mode: 'insensitive' } },
+            { username: { equals: agentName, mode: 'insensitive' } },
+          ],
           workspaceMembership: { workspaceId: tokenRecord.workspaceId, role: 'AGENT' },
         },
       });
@@ -1270,19 +1274,6 @@ export class WorkspaceTokenService {
     const cleanToken = sanitizeToken(token);
     const cleanName = fullName.trim();
 
-    // Verify First-Open Browser Session Lock
-    if (sessionId) {
-      const activeLock = this.tokenOpenSessionLocks.get(cleanToken);
-      if (activeLock) {
-        const isExpired = Date.now() - activeLock.openedAt.getTime() > 30 * 60 * 1000;
-        if (!isExpired && activeLock.sessionId !== sessionId) {
-          throw new BadRequestException(
-            'This token is currently locked to another active browser session.',
-          );
-        }
-      }
-    }
-
     const agentStatus = await this.getAgentTokenStatus(cleanToken, sessionId);
     if (!agentStatus.valid) {
       throw new BadRequestException(agentStatus.error || 'Token is not valid.');
@@ -1394,10 +1385,10 @@ export class WorkspaceTokenService {
         isUsed: true,
         usedBy: cleanName,
         usedAt: new Date(),
+        openedBySession: null,
+        openedAt: null,
       },
     });
-
-    this.tokenOpenSessionLocks.delete(cleanToken);
 
     // Start activity session for agent
     try {
@@ -1606,9 +1597,6 @@ export class WorkspaceTokenService {
         data: { inviteToken: newTokenStr },
       });
     }
-
-    // Invalidate any open session locks for the old token
-    this.tokenOpenSessionLocks.delete(cleanToken);
 
     this.logger.log(
       `Regenerated ${tokenRecord.role} token for Pod "${tokenRecord.workspace.name}": ${cleanToken} -> ${newTokenStr}`,
